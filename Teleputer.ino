@@ -95,7 +95,8 @@ static constexpr uint16_t COL_BG_DARK        = 0x0842; // #080810 Deep obsidian
 static constexpr uint16_t COL_BG_PANEL_LEFT  = 0x1084; // #101020 Left list background
 static constexpr uint16_t COL_BG_PANEL_RIGHT = 0x0863; // #080C18 Right preview background
 static constexpr uint16_t COL_BG_ROW_ALT     = 0x14A5; // #141428 Alternating row background (View A list)
-static constexpr uint16_t COL_BG_ROW_SEL     = 0x1D5E; // #182A70 Highlighted active chat / selected msg
+static constexpr uint16_t COL_BG_ROW_SEL     = 0x1D5E; // #182A70 Highlighted active chat in View A
+static constexpr uint16_t COL_BG_MSG_SEL     = 0x2104; // #202020 Subtle dark-grey highlight for selected message in View B
 static constexpr uint16_t COL_BG_HEADER      = 0x10A6; // #101430 Header bar dark navy
 static constexpr uint16_t COL_BG_INPUT       = 0x18E7; // #181C38 Bottom input bar background
 static constexpr uint16_t COL_BG_INPUT_BUSY  = 0x2945; // Dimmed input when freezing/sending
@@ -255,11 +256,16 @@ static unsigned long g_lastKeyPressMs     = 0;
 // ============================================================================
 void boostCardputerAdvMicGain() {
     if (M5.getBoard() == m5::board_t::board_M5CardputerADV) {
-        // M5Unified's internal callback sets Reg 0x14 = 0x10 (0dB PGA) and Reg 0x17 = 0xBF (0dB ADC).
-        // Boost ES8311 analog PGA gain (+30dB = 0x1A) and digital ADC volume (+16dB = 0xDF)
-        // on I2C address 0x18 after Mic.record() initializes the ES8311 codec:
-        M5.In_I2C.writeRegister8(0x18, 0x14, 0x1A, 400000);
-        M5.In_I2C.writeRegister8(0x18, 0x17, 0xDF, 400000);
+        // ES8311 derives MCLK from BCLK (0x01=0xBA) and ignores 0x0D/0x0E power-up writes made before
+        // I2S BCLK is running. Re-arm the full ES8311 ADC capture path once I2S RX clock is active:
+        M5.In_I2C.writeRegister8(0x18, 0x00, 0x80, 400000); // CSM POWER ON
+        M5.In_I2C.writeRegister8(0x18, 0x01, 0xBA, 400000); // MCLK = BCLK, enable ADC/DAC clocks
+        M5.In_I2C.writeRegister8(0x18, 0x02, 0x18, 400000); // MULT_PRE = 3
+        M5.In_I2C.writeRegister8(0x18, 0x0D, 0x01, 400000); // Power up analog circuitry (arms ADC while BCLK runs)
+        M5.In_I2C.writeRegister8(0x18, 0x0E, 0x02, 400000); // Enable analog PGA & ADC modulator
+        M5.In_I2C.writeRegister8(0x18, 0x14, 0x1A, 400000); // Mic1p-Mic1n +30dB analog PGA gain
+        M5.In_I2C.writeRegister8(0x18, 0x17, 0xDF, 400000); // +16dB digital ADC volume
+        M5.In_I2C.writeRegister8(0x18, 0x1C, 0x6A, 400000); // ADC EQ bypass + DC offset cancel
     }
 }
 
@@ -962,7 +968,38 @@ void backgroundPollTaskCore0(void* param) {
                                     ev.mediaFileId      = String(audioObj["file_id"] | "");
                                     ev.mediaDurationSec = audioObj["duration"] | 1;
                                     ev.mediaType        = MediaType::AUDIO;
-                                    ev.text             = "[Audio " + String(ev.mediaDurationSec) + "s - Enter]";
+                                    String fName        = sanitizeText(String(audioObj["file_name"] | ""));
+                                    if (!fName.isEmpty()) {
+                                        ev.text = "[WAV: " + fName + " - Enter]";
+                                    } else {
+                                        ev.text = "[Audio " + String(ev.mediaDurationSec) + "s - Enter]";
+                                    }
+                                } else if (!message["document"].isNull()) {
+                                    JsonObject docObj = message["document"];
+                                    String docFileId  = String(docObj["file_id"] | "");
+                                    String docName    = sanitizeText(String(docObj["file_name"] | ""));
+                                    String docMime    = String(docObj["mime_type"] | "");
+                                    String lowerName  = docName;
+                                    lowerName.toLowerCase();
+                                    String lowerMime  = docMime;
+                                    lowerMime.toLowerCase();
+                                    String cap        = sanitizeText(String(message["caption"] | ""));
+
+                                    if (lowerName.endsWith(".wav") || lowerMime.indexOf("wav") >= 0 || lowerMime.startsWith("audio/")) {
+                                        ev.mediaFileId      = docFileId;
+                                        ev.mediaDurationSec = 1;
+                                        ev.mediaType        = MediaType::AUDIO;
+                                        ev.text             = docName.isEmpty() ? "[WAV Audio - Enter]" : ("[WAV: " + docName + " - Enter]");
+                                        if (!cap.isEmpty()) ev.text += " " + cap;
+                                    } else if (lowerName.endsWith(".jpg") || lowerName.endsWith(".jpeg") || lowerMime.indexOf("jpeg") >= 0 || lowerMime.indexOf("jpg") >= 0) {
+                                        ev.mediaFileId      = docFileId;
+                                        ev.mediaType        = MediaType::PHOTO;
+                                        ev.text             = "[Photo - Enter to View]";
+                                        if (!cap.isEmpty()) ev.text += " " + cap;
+                                    } else {
+                                        ev.text = docName.isEmpty() ? "[Document]" : ("[File: " + docName + "]");
+                                        if (!cap.isEmpty()) ev.text += " " + cap;
+                                    }
                                 } else if (!message["video_note"].isNull()) {
                                     JsonObject vnObj    = message["video_note"];
                                     ev.mediaFileId      = String(vnObj["file_id"] | "");
@@ -1344,7 +1381,7 @@ void pumpVoiceRecording() {
     if (!g_isRecordingVoice) return;
 
     while (M5Cardputer.Mic.isRecording() < 2) {
-        if (g_recWriteStep == 0) {
+        if (g_recWriteStep <= 2) {
             boostCardputerAdvMicGain();
         }
         int nextQueueSlot = static_cast<int>(g_recQueueStep % 3);
@@ -2130,7 +2167,7 @@ void renderViewBConversation() {
                 bool isMsgSelected = (item.msgIndex == g_selectedMsgIndex);
 
                 if (isMsgSelected) {
-                    canvas.fillRect(2, rowY, SCREEN_WIDTH - 4, lineHeight - 1, COL_BG_ROW_SEL);
+                    canvas.fillRect(2, rowY, SCREEN_WIDTH - 4, lineHeight - 1, COL_BG_MSG_SEL);
                     if (item.isOutgoing) {
                         canvas.fillRect(SCREEN_WIDTH - 4, rowY, 2, lineHeight - 1, COL_ACCENT_CYAN);
                     } else {
