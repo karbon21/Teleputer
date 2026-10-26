@@ -1,22 +1,19 @@
 /**
  * @file Teleputer.ino
  * @brief Bidirectional Real-Time Telegram Bot Client Firmware for M5Stack Cardputer ADV (ESP32-S3)
- *        with Full SD Card Chat & Audio Persistence, Voice Recording/Playback,
- *        Adaptive Near-Instant Polling, and Multi-Stage Screen/Battery Power Management.
- *
- * Target Hardware:
- *  - MCU: ESP32-S3 (M5Stack Cardputer / Cardputer ADV)
- *  - Display: 1.14" ST7789V2 LCD (240x135) via M5GFX double-buffered Canvas
- *  - Keyboard: Full Matrix Keyboard via M5Cardputer.Keyboard
- *  - Storage: MicroSD Card via SPI (SCK: 40, MISO: 39, MOSI: 14, CS: 12)
- *  - Audio: Built-in Speaker & PDM Microphone via M5Cardputer.Speaker / M5Cardputer.Mic
+ *        - Zero-Lag Dual-Core Architecture: Core 0 handles HTTPS socket waits ONLY;
+ *          Core 1 owns all SPI (Display + MicroSD), Keyboard, and Audio hardware (zero bus contention).
+ *        - Low-RAM Footprint (>170 KB free heap for mbedTLS & Wi-Fi at all times).
+ *        - Double-Buffered DMA Voice Recording & Gapless WAV Playback.
+ *        - Full MicroSD Chat History & Audio Persistence (/tg_chats & /tg_audio).
+ *        - Multi-Stage Screen Timeout (15s dim -> 5s off) & Adaptive Polling (1.5s active / 10s sleep).
  *
  * Key Controls:
  *  - [TAB]       : Toggle between View A (Chat List Hub) and View B (Conversation Thread)
  *  - [;] / [.]   : Navigate chat list in View A (or [Fn + ;] / [Fn + .] to scroll chat in View B)
  *  - [ENTER]     : Open selected chat (View A) / Send typed message or finish voice recording (View B)
  *  - [Fn + R]    : Start / Stop & Send Voice Recording in View B
- *  - [Fn + P]    : Play latest Voice Message or Video Message (Audio-Only) in View B
+ *  - [Fn + P]    : Play latest Voice/Audio Message in View B
  */
 
 #include <Arduino.h>
@@ -28,6 +25,9 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
 #include <vector>
 #include <deque>
 
@@ -68,18 +68,18 @@ static constexpr uint8_t BRIGHTNESS_AWAKE  = 180;
 static constexpr uint8_t BRIGHTNESS_DIMMED = 22;
 static constexpr uint8_t BRIGHTNESS_OFF    = 0;
 
-// Voice Recording & Playback Constants
-static constexpr uint32_t VOICE_SAMPLE_RATE     = 16000; // 16 kHz mono PCM
-static constexpr size_t   VOICE_CHUNK_SAMPLES   = 512;   // 32ms per chunk at 16kHz
-static constexpr uint32_t MAX_RECORD_SECONDS    = 15;    // Max 15s per voice note
+// Voice Recording & Playback Constants (2 KB total ping-pong DMA RAM -> zero heap pressure!)
+static constexpr uint32_t VOICE_SAMPLE_RATE      = 16000; // 16 kHz mono 16-bit PCM
+static constexpr size_t   AUDIO_DMA_SAMPLES      = 512;   // 32ms per DMA slot (1024 bytes)
+static constexpr uint32_t MAX_RECORD_SECONDS     = 12;    // Max 12s per voice note
 
 // Memory & Storage Limits
-static constexpr size_t MAX_CONTACTS            = 30;
-static constexpr size_t MAX_MESSAGES_IN_RAM     = 100;   // Kept in RAM deque per chat, full log on SD
+static constexpr size_t MAX_CONTACTS            = 25;
+static constexpr size_t MAX_MESSAGES_IN_RAM     = 60;
 static constexpr size_t JSON_CONFIG_DOC_SIZE    = 1024;
-static constexpr size_t JSON_POLL_DOC_SIZE      = 16384;
-static constexpr size_t JSON_SEND_DOC_SIZE      = 2048;
-static constexpr size_t JSON_LINE_DOC_SIZE      = 1024;
+static constexpr size_t JSON_POLL_DOC_SIZE      = 8192;
+static constexpr size_t JSON_SEND_DOC_SIZE      = 1536;
+static constexpr size_t JSON_LINE_DOC_SIZE      = 768;
 
 static const char* CONFIG_FILE_PATH    = "/tg_config.json";
 static const char* CONTACTS_INDEX_PATH = "/tg_contacts.json";
@@ -126,7 +126,7 @@ enum class ScreenPowerState : uint8_t {
 enum class MediaType : uint8_t {
     NONE = 0,
     VOICE,                 // Incoming/Outgoing voice note
-    AUDIO,                 // Audio file
+    AUDIO,                 // Audio file (.wav / .mp3)
     VIDEO_AUDIO_ONLY       // Video message / Video note (plays audio only)
 };
 
@@ -134,9 +134,9 @@ struct ChatMessage {
     bool isOutgoing;       // false = Incoming (grey, left), true = Outgoing (blue, right)
     String text;           // UTF-8 / ASCII sanitized message body
     uint32_t timestamp;    // Unix epoch or relative seconds
-    MediaType mediaType = MediaType::NONE;
-    String mediaFileId  = "";
-    String localAudioPath = ""; // Permanent file path on MicroSD (/tg_audio/...)
+    MediaType mediaType    = MediaType::NONE;
+    String mediaFileId     = "";
+    String localAudioPath  = ""; // Permanent file path on MicroSD (/tg_audio/...)
     uint16_t mediaDurationSec = 0;
 };
 
@@ -153,13 +153,27 @@ struct AppConfig {
     String wifiSsid;
     String wifiPass;
     String botToken;
+    String transcodeUrl;
     bool valid = false;
 };
 
 struct WrappedMessageLine {
     bool isOutgoing;
-    bool isLastLineOfMsg;  // Used to draw the thin dark separator line between messages
+    bool isLastLineOfMsg;
     String lineText;
+};
+
+// Parsed incoming message passed from Core 0 network poll to Core 1
+struct IncomingUpdateEvent {
+    int64_t updateId;
+    int64_t chatId;
+    String displayName;
+    String username;
+    String text;
+    uint32_t timestamp;
+    MediaType mediaType;
+    String mediaFileId;
+    uint16_t mediaDurationSec;
 };
 
 #pragma pack(push, 1)
@@ -172,8 +186,8 @@ struct WavHeader {
     uint16_t formatType    = 1; // 1 = PCM
     uint16_t channels      = 1; // Mono
     uint32_t sampleRate    = VOICE_SAMPLE_RATE;
-    uint32_t byteRate      = VOICE_SAMPLE_RATE * 2;
-    uint16_t blockAlign    = 2;
+    uint32_t byteRate      = VOICE_SAMPLE_RATE * sizeof(int16_t);
+    uint16_t blockAlign    = sizeof(int16_t);
     uint16_t bitsPerSample = 16;
     char     dataChunk[4]  = {'d', 'a', 't', 'a'};
     uint32_t dataSize      = 0;
@@ -186,8 +200,17 @@ struct WavHeader {
 static M5Canvas canvas(&M5Cardputer.Display);
 static AppConfig g_config;
 static AppView g_currentView = AppView::CHAT_LIST_HUB;
-static ScreenPowerState g_screenState = ScreenPowerState::AWAKE;
+static volatile ScreenPowerState g_screenState = ScreenPowerState::AWAKE;
 
+// Lightweight mutex ONLY for queuing parsed incoming messages from Core 0 to Core 1
+static SemaphoreHandle_t g_queueMutex = nullptr;
+static TaskHandle_t g_pollTaskHandle  = nullptr;
+static std::vector<IncomingUpdateEvent> g_incomingQueue;
+static volatile bool g_pauseBackgroundPoll = false;
+static volatile int64_t g_lastUpdateId     = 0;
+static String g_netStatusBadge             = "LIVE";
+
+// Owned exclusively by Core 1 (UI / SD / Keyboard / Audio) -> zero mutex stalls!
 static std::vector<ContactChat> g_chats;
 static int g_selectedChatIndex  = 0;
 static int g_listScrollOffset   = 0;
@@ -199,33 +222,34 @@ static bool g_isPlayingAudio     = false;
 static String g_audioPlayBanner  = "";
 static bool g_uiDirty            = true;
 
-// Voice Recording State
-static bool g_isRecordingVoice             = false;
+// 2-slot Ping-Pong DMA Buffer (only 2 KB total!) used for both Recording & Playback
+static int16_t g_audioDmaBuf[2][AUDIO_DMA_SAMPLES];
+static bool g_isRecordingVoice        = false;
 static File g_recordFile;
-static String g_activeRecordPath           = "";
-static unsigned long g_recordStartMs       = 0;
-static uint32_t g_recordedDataBytes        = 0;
-static uint32_t g_audioFileCounter         = 0;
-static int16_t g_micBuffer[VOICE_CHUNK_SAMPLES];
+static String g_activeRecordPath      = "";
+static unsigned long g_recordStartMs  = 0;
+static uint32_t g_recordedDataBytes   = 0;
+static int g_recActiveSlot            = 0;
+static int32_t g_recDcEstimate        = 0;
+static uint32_t g_audioFileCounter    = 0;
 
-// Timers & Polling State
-static int64_t g_lastUpdateId              = 0;
-static unsigned long g_lastPollTimeMs      = 0;
-static unsigned long g_lastUserActivityMs  = 0;
-static String g_statusBadge                = "IDLE";
-
-// Persistent TLS client for low-power session reuse
-static WiFiClientSecure g_tlsClient;
+// Timers & Debounce State
+static unsigned long g_lastUserActivityMs = 0;
+static unsigned long g_lastKeyPressMs     = 0;
 
 // ============================================================================
-// SPEAKER / MICROPHONE BUS SWITCHING & CHIMES
+// SPEAKER / MICROPHONE SWITCHING (PRESERVES M5CARDPUTER ADV ES8311 CODEC)
 // ============================================================================
 void ensureSpeakerActive() {
     if (M5Cardputer.Mic.isEnabled()) {
+        while (M5Cardputer.Mic.isRecording()) {
+            delay(1);
+        }
         M5Cardputer.Mic.end();
     }
     if (!M5Cardputer.Speaker.isEnabled()) {
         M5Cardputer.Speaker.begin();
+        M5Cardputer.Speaker.setVolume(255);
     }
 }
 
@@ -235,38 +259,33 @@ void ensureMicActive() {
         M5Cardputer.Speaker.end();
     }
     if (!M5Cardputer.Mic.isEnabled()) {
-        auto micCfg = M5Cardputer.Mic.config();
-        micCfg.sample_rate = VOICE_SAMPLE_RATE;
-        micCfg.magnification = 16;
-        micCfg.noise_filter_level = 1;
-        M5Cardputer.Mic.config(micCfg);
         M5Cardputer.Mic.begin();
     }
 }
 
 void playNotificationChime() {
-    if (g_isRecordingVoice) return;
+    if (g_isRecordingVoice || g_isPlayingAudio) return;
     ensureSpeakerActive();
-    M5Cardputer.Speaker.setVolume(150);
+    M5Cardputer.Speaker.setVolume(190);
     M5Cardputer.Speaker.tone(1046, 70); // C6
     delay(80);
     M5Cardputer.Speaker.tone(1318, 95); // E6
 }
 
 void playSendChime() {
-    if (g_isRecordingVoice) return;
+    if (g_isRecordingVoice || g_isPlayingAudio) return;
     ensureSpeakerActive();
-    M5Cardputer.Speaker.setVolume(110);
+    M5Cardputer.Speaker.setVolume(150);
     M5Cardputer.Speaker.tone(880, 45);
 }
 
 void playErrorChime() {
-    if (g_isRecordingVoice) return;
+    if (g_isRecordingVoice || g_isPlayingAudio) return;
     ensureSpeakerActive();
-    M5Cardputer.Speaker.setVolume(150);
-    M5Cardputer.Speaker.tone(330, 130);
-    delay(140);
-    M5Cardputer.Speaker.tone(220, 180);
+    M5Cardputer.Speaker.setVolume(190);
+    M5Cardputer.Speaker.tone(330, 120);
+    delay(130);
+    M5Cardputer.Speaker.tone(220, 160);
 }
 
 // ============================================================================
@@ -406,7 +425,7 @@ String ellipsizeText(M5Canvas& gfx, const String& text, int maxWidthPx) {
 }
 
 // ============================================================================
-// SD CARD CONFIGURATION, FULL CHAT HISTORY & AUDIO FILE PERSISTENCE
+// SD CARD CONFIGURATION, FULL CHAT HISTORY & AUDIO FILE PERSISTENCE (CORE 1)
 // ============================================================================
 String getChatHistoryFilePath(int64_t chatId) {
     return String(CHAT_HISTORY_DIR) + "/chat_" + String(chatId) + ".jsonl";
@@ -464,7 +483,7 @@ void renderFatalErrorScreen(const String& title, const String& subtitle, const S
 bool initSDAndLoadConfig(AppConfig& outCfg) {
     SPI.begin(SD_SPI_SCK_PIN, SD_SPI_MISO_PIN, SD_SPI_MOSI_PIN, SD_SPI_CS_PIN);
 
-    if (!SD.begin(SD_SPI_CS_PIN, SPI, 25000000)) {
+    if (!SD.begin(SD_SPI_CS_PIN, SPI, 20000000)) {
         playErrorChime();
         renderFatalErrorScreen(
             "MicroSD Mount Failed (CS: GPIO 12)",
@@ -514,13 +533,10 @@ bool initSDAndLoadConfig(AppConfig& outCfg) {
         return false;
     }
 
-    const char* ssid  = doc["wifi_ssid"] | "";
-    const char* pass  = doc["wifi_pass"] | "";
-    const char* token = doc["token"]     | "";
-
-    outCfg.wifiSsid = String(ssid);
-    outCfg.wifiPass = String(pass);
-    outCfg.botToken = String(token);
+    outCfg.wifiSsid     = String(doc["wifi_ssid"] | "");
+    outCfg.wifiPass     = String(doc["wifi_pass"] | "");
+    outCfg.botToken     = String(doc["token"]     | "");
+    outCfg.transcodeUrl = String(doc["transcode_url"] | "");
     doc.clear();
 
     if (outCfg.wifiSsid.isEmpty() || outCfg.botToken.isEmpty()) {
@@ -539,9 +555,6 @@ bool initSDAndLoadConfig(AppConfig& outCfg) {
     return true;
 }
 
-/**
- * @brief Appends a single ChatMessage to the contact's persistent JSONL log on MicroSD.
- */
 void appendMessageToSDHistory(int64_t chatId, const ChatMessage& msg) {
     ensureStorageDirectories();
     String path = getChatHistoryFilePath(chatId);
@@ -566,9 +579,6 @@ void appendMessageToSDHistory(int64_t chatId, const ChatMessage& msg) {
     doc.clear();
 }
 
-/**
- * @brief Rewrites the entire per-chat JSONL history file on MicroSD (used when updating localAudioPath).
- */
 void rewriteFullChatHistoryToSD(const ContactChat& chat) {
     ensureStorageDirectories();
     String path = getChatHistoryFilePath(chat.chatId);
@@ -595,9 +605,6 @@ void rewriteFullChatHistoryToSD(const ContactChat& chat) {
     doc.clear();
 }
 
-/**
- * @brief Loads the entire saved message history for a contact from `/tg_chats/chat_<id>.jsonl`.
- */
 void loadChatHistoryFromSD(ContactChat& chat) {
     String path = getChatHistoryFilePath(chat.chatId);
     if (!SD.exists(path.c_str())) return;
@@ -634,9 +641,6 @@ void loadChatHistoryFromSD(ContactChat& chat) {
     doc.clear();
 }
 
-/**
- * @brief Saves the contact list index and last processed update_id to `/tg_contacts.json`.
- */
 void saveContactsIndexToSD() {
     File f = SD.open(CONTACTS_INDEX_PATH, FILE_WRITE);
     if (!f) return;
@@ -656,9 +660,6 @@ void saveContactsIndexToSD() {
     doc.clear();
 }
 
-/**
- * @brief Loads the contact list index and each contact's full message history from MicroSD.
- */
 void loadContactsAndHistoriesFromSD() {
     if (!SD.exists(CONTACTS_INDEX_PATH)) return;
     File f = SD.open(CONTACTS_INDEX_PATH, FILE_READ);
@@ -671,7 +672,6 @@ void loadContactsAndHistoriesFromSD() {
             g_lastUpdateId = doc["last_update_id"] | 0;
             arr = doc["contacts"].as<JsonArray>();
         } else if (doc.is<JsonArray>()) {
-            // Backwards compatibility with older /tg_contacts.json format
             arr = doc.as<JsonArray>();
         }
 
@@ -686,18 +686,6 @@ void loadContactsAndHistoriesFromSD() {
 
             if (c.chatId != 0) {
                 loadChatHistoryFromSD(c);
-                // Legacy fallback if upgrading from single-message cache
-                if (c.messages.empty() && !o["last_msg"].isNull()) {
-                    ChatMessage m;
-                    m.isOutgoing       = o["last_out"] | false;
-                    m.text             = o["last_msg"] | "";
-                    m.timestamp        = 0;
-                    m.mediaType        = static_cast<MediaType>(o["last_mtype"] | 0);
-                    m.mediaFileId      = o["last_fid"] | "";
-                    m.mediaDurationSec = o["last_dur"] | 0;
-                    c.messages.push_back(m);
-                    appendMessageToSDHistory(c.chatId, m);
-                }
                 g_chats.push_back(c);
             }
         }
@@ -707,8 +695,28 @@ void loadContactsAndHistoriesFromSD() {
 }
 
 // ============================================================================
-// CHAT LIST MANAGEMENT
+// CHAT LIST MANAGEMENT (PRESERVES CURRENTLY SELECTED CHAT ON INCOMING UPDATES)
 // ============================================================================
+int64_t getSelectedChatId() {
+    if (g_chats.empty() || g_selectedChatIndex < 0 || g_selectedChatIndex >= static_cast<int>(g_chats.size())) {
+        return 0;
+    }
+    return g_chats[g_selectedChatIndex].chatId;
+}
+
+void restoreSelectedChatById(int64_t targetChatId) {
+    if (targetChatId == 0 || g_chats.empty()) return;
+    for (size_t i = 0; i < g_chats.size(); ++i) {
+        if (g_chats[i].chatId == targetChatId) {
+            g_selectedChatIndex = static_cast<int>(i);
+            return;
+        }
+    }
+}
+
+/**
+ * @brief Finds an existing contact or inserts a new contact without hijacking the user's active chat!
+ */
 int findOrCreateChat(int64_t chatId, const String& displayName, const String& username) {
     for (size_t i = 0; i < g_chats.size(); ++i) {
         if (g_chats[i].chatId == chatId) {
@@ -717,6 +725,8 @@ int findOrCreateChat(int64_t chatId, const String& displayName, const String& us
             return static_cast<int>(i);
         }
     }
+
+    int64_t previousSelectedId = getSelectedChatId();
 
     ContactChat newChat;
     newChat.chatId       = chatId;
@@ -729,27 +739,32 @@ int findOrCreateChat(int64_t chatId, const String& displayName, const String& us
         g_chats.pop_back();
     }
     g_chats.insert(g_chats.begin(), newChat);
+
+    // Keep user's current chat selection anchored so a new user /start-ing the bot
+    // NEVER switches the active conversation away from who you are currently texting!
+    if (previousSelectedId != 0) {
+        restoreSelectedChatById(previousSelectedId);
+    }
+
     return 0;
 }
 
-void promoteChatToTop(int index) {
-    if (index <= 0 || index >= static_cast<int>(g_chats.size())) return;
+void promoteChatToTop(int index, bool switchSelectionToTop) {
+    if (index <= 0 || index >= static_cast<int>(g_chats.size())) {
+        if (switchSelectionToTop) g_selectedChatIndex = 0;
+        return;
+    }
 
-    int64_t activeChatId = (g_selectedChatIndex >= 0 && g_selectedChatIndex < static_cast<int>(g_chats.size()))
-                           ? g_chats[g_selectedChatIndex].chatId
-                           : 0;
+    int64_t previousSelectedId = getSelectedChatId();
 
     ContactChat moved = g_chats[index];
     g_chats.erase(g_chats.begin() + index);
     g_chats.insert(g_chats.begin(), moved);
 
-    if (g_currentView == AppView::CONVERSATION_THREAD && activeChatId != 0) {
-        for (size_t i = 0; i < g_chats.size(); ++i) {
-            if (g_chats[i].chatId == activeChatId) {
-                g_selectedChatIndex = static_cast<int>(i);
-                break;
-            }
-        }
+    if (switchSelectionToTop) {
+        g_selectedChatIndex = 0;
+    } else if (previousSelectedId != 0) {
+        restoreSelectedChatById(previousSelectedId);
     }
 }
 
@@ -776,10 +791,8 @@ void appendMessageToChat(int chatIdx, bool isOutgoing, const String& text, uint3
     chat.messages.push_back(msg);
     chat.lastActivity = ts;
 
-    // Immediately persist the new message to this chat's SD card history file
     appendMessageToSDHistory(chat.chatId, msg);
 
-    // Mark unread if incoming and either not in View B for this chat OR screen is off
     if (!isOutgoing) {
         bool activelyViewingThisChat = (g_currentView == AppView::CONVERSATION_THREAD &&
                                         g_selectedChatIndex == chatIdx &&
@@ -791,7 +804,7 @@ void appendMessageToChat(int chatIdx, bool isOutgoing, const String& text, uint3
 }
 
 // ============================================================================
-// TELEGRAM BOT API NETWORKING (TEXT + VOICE UPLOAD + MEDIA DOWNLOAD)
+// CORE 0 BACKGROUND POLLING TASK (PURE NETWORK ONLY - NEVER TOUCHES SPI/SD!)
 // ============================================================================
 String buildBotApiUrl(const char* method) {
     String url = "https://api.telegram.org/bot";
@@ -801,284 +814,215 @@ String buildBotApiUrl(const char* method) {
     return url;
 }
 
-/**
- * @brief Resolves Telegram file_path from file_id and downloads the media stream to MicroSD.
- */
-bool downloadTelegramMediaFile(const String& fileId, const char* destPath) {
-    if (WiFi.status() != WL_CONNECTED || fileId.isEmpty()) return false;
+void backgroundPollTaskCore0(void* param) {
+    (void)param;
+    WiFiClientSecure pollClient;
+    pollClient.setInsecure();
+    pollClient.setTimeout(3);
 
-    ensureStorageDirectories();
+    unsigned long lastPollMs = 0;
 
-    HTTPClient https;
-    https.setReuse(true);
-    https.setTimeout(5000);
+    while (true) {
+        unsigned long now = millis();
+        unsigned long interval = getCurrentPollIntervalMs();
 
-    String getFileUrl = buildBotApiUrl("getFile") + "?file_id=" + fileId;
-    if (!https.begin(g_tlsClient, getFileUrl)) return false;
+        if (!g_pauseBackgroundPoll && (now - lastPollMs >= interval)) {
+            lastPollMs = now;
 
-    int code = https.GET();
-    String remoteFilePath = "";
-    if (code == HTTP_CODE_OK) {
-        DynamicJsonDocument doc(JSON_SEND_DOC_SIZE);
-        if (deserializeJson(doc, https.getStream()) == DeserializationError::Ok && (doc["ok"] | false)) {
-            remoteFilePath = String(doc["result"]["file_path"] | "");
-        }
-        doc.clear();
-    }
-    https.end();
+            if (WiFi.status() != WL_CONNECTED) {
+                WiFi.reconnect();
+                g_netStatusBadge = "RECONN";
+            } else {
+                HTTPClient https;
+                https.setReuse(true);
+                https.setTimeout(2200);
 
-    if (remoteFilePath.isEmpty()) return false;
+                String url = buildBotApiUrl("getUpdates");
+                url += "?timeout=0&limit=5&allowed_updates=%5B%22message%22%5D";
+                int64_t offsetId = g_lastUpdateId;
+                if (offsetId > 0) {
+                    url += "&offset=" + String(offsetId + 1);
+                }
 
-    String dlUrl = "https://api.telegram.org/file/bot" + g_config.botToken + "/" + remoteFilePath;
-    if (!https.begin(g_tlsClient, dlUrl)) return false;
+                if (https.begin(pollClient, url)) {
+                    int httpCode = https.GET();
+                    if (httpCode == HTTP_CODE_OK) {
+                        DynamicJsonDocument doc(JSON_POLL_DOC_SIZE);
+                        DeserializationError err = deserializeJson(doc, https.getStream());
 
-    int dlCode = https.GET();
-    if (dlCode != HTTP_CODE_OK) {
-        https.end();
-        return false;
-    }
+                        if (!err && (doc["ok"] | false)) {
+                            g_netStatusBadge = (g_screenState == ScreenPowerState::OFF) ? "SLEEP" : "LIVE";
+                            JsonArray results = doc["result"].as<JsonArray>();
 
-    if (SD.exists(destPath)) SD.remove(destPath);
-    File out = SD.open(destPath, FILE_WRITE);
-    if (!out) {
-        https.end();
-        return false;
-    }
+                            for (JsonObject update : results) {
+                                int64_t updateId = update["update_id"].as<int64_t>();
+                                if (updateId > g_lastUpdateId) {
+                                    g_lastUpdateId = updateId;
+                                }
 
-    WiFiClient* stream = https.getStreamPtr();
-    int remaining = https.getSize();
-    uint8_t buf[1024];
-    unsigned long lastReadMs = millis();
+                                JsonObject message = update["message"];
+                                if (message.isNull()) continue;
 
-    while (https.connected() && (remaining > 0 || remaining == -1)) {
-        size_t avail = stream->available();
-        if (avail > 0) {
-            size_t toRead = (avail > sizeof(buf)) ? sizeof(buf) : avail;
-            int readBytes = stream->readBytes(buf, toRead);
-            if (readBytes > 0) {
-                out.write(buf, readBytes);
-                if (remaining > 0) remaining -= readBytes;
-                lastReadMs = millis();
+                                JsonObject chat = message["chat"];
+                                if (chat.isNull()) continue;
+
+                                IncomingUpdateEvent ev;
+                                ev.updateId = updateId;
+                                ev.chatId   = chat["id"].as<int64_t>();
+
+                                String firstName = sanitizeText(String(chat["first_name"] | ""));
+                                String lastName  = sanitizeText(String(chat["last_name"]  | ""));
+                                ev.username      = sanitizeText(String(chat["username"]   | ""));
+                                String title     = sanitizeText(String(chat["title"]      | ""));
+
+                                ev.displayName = firstName;
+                                if (!lastName.isEmpty()) {
+                                    if (!ev.displayName.isEmpty()) ev.displayName += " ";
+                                    ev.displayName += lastName;
+                                }
+                                if (ev.displayName.isEmpty()) ev.displayName = title;
+                                if (ev.displayName.isEmpty()) ev.displayName = ev.username;
+                                if (ev.displayName.isEmpty()) ev.displayName = String(ev.chatId);
+
+                                ev.text             = String(message["text"] | "");
+                                ev.mediaType        = MediaType::NONE;
+                                ev.mediaFileId      = "";
+                                ev.mediaDurationSec = 0;
+
+                                if (!message["voice"].isNull()) {
+                                    JsonObject voiceObj = message["voice"];
+                                    ev.mediaFileId      = String(voiceObj["file_id"] | "");
+                                    ev.mediaDurationSec = voiceObj["duration"] | 1;
+                                    ev.mediaType        = MediaType::VOICE;
+                                    ev.text             = "[Voice " + String(ev.mediaDurationSec) + "s] (Fn+P Play)";
+                                } else if (!message["audio"].isNull()) {
+                                    JsonObject audioObj = message["audio"];
+                                    ev.mediaFileId      = String(audioObj["file_id"] | "");
+                                    ev.mediaDurationSec = audioObj["duration"] | 1;
+                                    ev.mediaType        = MediaType::AUDIO;
+                                    ev.text             = "[Audio " + String(ev.mediaDurationSec) + "s] (Fn+P Play)";
+                                } else if (!message["video_note"].isNull()) {
+                                    JsonObject vnObj    = message["video_note"];
+                                    ev.mediaFileId      = String(vnObj["file_id"] | "");
+                                    ev.mediaDurationSec = vnObj["duration"] | 1;
+                                    ev.mediaType        = MediaType::VIDEO_AUDIO_ONLY;
+                                    ev.text             = "[Video Msg " + String(ev.mediaDurationSec) + "s - Audio Only] (Fn+P)";
+                                } else if (!message["video"].isNull()) {
+                                    JsonObject vidObj   = message["video"];
+                                    ev.mediaFileId      = String(vidObj["file_id"] | "");
+                                    ev.mediaDurationSec = vidObj["duration"] | 1;
+                                    ev.mediaType        = MediaType::VIDEO_AUDIO_ONLY;
+                                    String cap          = String(message["caption"] | "");
+                                    ev.text             = "[Video Msg " + String(ev.mediaDurationSec) + "s - Audio Only] (Fn+P)";
+                                    if (!cap.isEmpty()) ev.text += " " + cap;
+                                } else if (ev.text.isEmpty()) {
+                                    if (!message["photo"].isNull())        ev.text = "[Photo]";
+                                    else if (!message["sticker"].isNull()) ev.text = "[Sticker]";
+                                    else                                   ev.text = "[Media]";
+                                }
+
+                                ev.timestamp = message["date"] | static_cast<uint32_t>(millis() / 1000);
+
+                                xSemaphoreTake(g_queueMutex, portMAX_DELAY);
+                                g_incomingQueue.push_back(ev);
+                                xSemaphoreGive(g_queueMutex);
+                            }
+                        }
+                        doc.clear();
+                    }
+                    https.end();
+                }
             }
-        } else {
-            if (millis() - lastReadMs > 4000UL) break;
-            delay(5);
         }
-    }
 
-    out.close();
-    https.end();
-    return true;
+        vTaskDelay(pdMS_TO_TICKS(30));
+    }
 }
 
 /**
- * @brief Polls Telegram Bot API `getUpdates` for new incoming messages (including voice & video).
- *        Automatically saves incoming audio/video-note files to `/tg_audio/` on the MicroSD card.
+ * @brief Drains any newly arrived messages from `g_incomingQueue` on Core 1,
+ *        writes them to MicroSD, plays the notification chime, and updates the UI
+ *        without switching away from the user's currently active chat!
  */
-bool pollTelegramUpdates() {
-    if (WiFi.status() != WL_CONNECTED) {
-        g_statusBadge = "NO WIFI";
-        g_uiDirty = true;
-        return false;
+void processIncomingQueueCore1() {
+    std::vector<IncomingUpdateEvent> batch;
+    xSemaphoreTake(g_queueMutex, portMAX_DELAY);
+    if (!g_incomingQueue.empty()) {
+        batch.swap(g_incomingQueue);
     }
+    xSemaphoreGive(g_queueMutex);
 
-    HTTPClient https;
-    https.setReuse(true);
-    https.setTimeout(2500);
+    if (batch.empty()) return;
 
-    String url = buildBotApiUrl("getUpdates");
-    url += "?timeout=0&limit=8&allowed_updates=%5B%22message%22%5D";
-    if (g_lastUpdateId > 0) {
-        url += "&offset=" + String(g_lastUpdateId + 1);
-    }
+    int64_t activeChatBefore = getSelectedChatId();
 
-    if (!https.begin(g_tlsClient, url)) {
-        g_statusBadge = "NET ERR";
-        return false;
-    }
+    for (const auto& ev : batch) {
+        int idx = findOrCreateChat(ev.chatId, ev.displayName, ev.username);
+        appendMessageToChat(idx, false, ev.text, ev.timestamp,
+                            ev.mediaType, ev.mediaFileId, ev.mediaDurationSec, "");
+        // Promote incoming chat to top of the list, but NEVER switch the user's active selection!
+        promoteChatToTop(idx, false);
 
-    int httpCode = https.GET();
-    bool receivedNewIncoming = false;
-
-    struct PendingMediaDownload {
-        int64_t chatId;
-        String fileId;
-        String destPath;
-    };
-    std::vector<PendingMediaDownload> mediaToDownload;
-
-    if (httpCode == HTTP_CODE_OK) {
-        DynamicJsonDocument doc(JSON_POLL_DOC_SIZE);
-        DeserializationError err = deserializeJson(doc, https.getStream());
-
-        if (!err && (doc["ok"] | false)) {
-            g_statusBadge = (g_screenState == ScreenPowerState::OFF) ? "SLEEP" : "LIVE";
-            JsonArray results = doc["result"].as<JsonArray>();
-
-            for (JsonObject update : results) {
-                int64_t updateId = update["update_id"].as<int64_t>();
-                if (updateId > g_lastUpdateId) {
-                    g_lastUpdateId = updateId;
-                }
-
-                JsonObject message = update["message"];
-                if (message.isNull()) continue;
-
-                JsonObject chat = message["chat"];
-                if (chat.isNull()) continue;
-
-                int64_t chatId = chat["id"].as<int64_t>();
-                String firstName = sanitizeText(String(chat["first_name"] | ""));
-                String lastName  = sanitizeText(String(chat["last_name"]  | ""));
-                String username  = sanitizeText(String(chat["username"]   | ""));
-                String title     = sanitizeText(String(chat["title"]      | ""));
-
-                String displayName = firstName;
-                if (!lastName.isEmpty()) {
-                    if (!displayName.isEmpty()) displayName += " ";
-                    displayName += lastName;
-                }
-                if (displayName.isEmpty()) displayName = title;
-                if (displayName.isEmpty()) displayName = username;
-                if (displayName.isEmpty()) displayName = String(chatId);
-
-                const char* rawText = message["text"] | "";
-                String msgText = String(rawText);
-                MediaType mediaType = MediaType::NONE;
-                String mediaFileId  = "";
-                String savedAudioPath = "";
-                uint16_t mediaDur   = 0;
-
-                // Check for Voice, Audio, Video Note, or Video messages
-                if (!message["voice"].isNull()) {
-                    JsonObject voiceObj = message["voice"];
-                    mediaFileId    = String(voiceObj["file_id"] | "");
-                    mediaDur       = voiceObj["duration"] | 1;
-                    mediaType      = MediaType::VOICE;
-                    savedAudioPath = generateUniqueAudioFilePath(chatId, false, ".oga");
-                    msgText        = "[Voice " + String(mediaDur) + "s] (Fn+P Play)";
-                } else if (!message["audio"].isNull()) {
-                    JsonObject audioObj = message["audio"];
-                    mediaFileId    = String(audioObj["file_id"] | "");
-                    mediaDur       = audioObj["duration"] | 1;
-                    mediaType      = MediaType::AUDIO;
-                    savedAudioPath = generateUniqueAudioFilePath(chatId, false, ".bin");
-                    msgText        = "[Audio " + String(mediaDur) + "s] (Fn+P Play)";
-                } else if (!message["video_note"].isNull()) {
-                    JsonObject vnObj = message["video_note"];
-                    mediaFileId    = String(vnObj["file_id"] | "");
-                    mediaDur       = vnObj["duration"] | 1;
-                    mediaType      = MediaType::VIDEO_AUDIO_ONLY;
-                    savedAudioPath = generateUniqueAudioFilePath(chatId, false, ".mp4");
-                    msgText        = "[Video Msg " + String(mediaDur) + "s - Audio Only] (Fn+P)";
-                } else if (!message["video"].isNull()) {
-                    JsonObject vidObj = message["video"];
-                    mediaFileId    = String(vidObj["file_id"] | "");
-                    mediaDur       = vidObj["duration"] | 1;
-                    mediaType      = MediaType::VIDEO_AUDIO_ONLY;
-                    savedAudioPath = generateUniqueAudioFilePath(chatId, false, ".mp4");
-                    String cap     = String(message["caption"] | "");
-                    msgText        = "[Video Msg " + String(mediaDur) + "s - Audio Only] (Fn+P)";
-                    if (!cap.isEmpty()) msgText += " " + cap;
-                } else if (msgText.isEmpty()) {
-                    if (!message["photo"].isNull())        msgText = "[Photo]";
-                    else if (!message["sticker"].isNull()) msgText = "[Sticker]";
-                    else                                   msgText = "[Media]";
-                }
-
-                uint32_t msgDate = message["date"] | static_cast<uint32_t>(millis() / 1000);
-
-                int idx = findOrCreateChat(chatId, displayName, username);
-                appendMessageToChat(idx, false, msgText, msgDate, mediaType, mediaFileId, mediaDur, savedAudioPath);
-                promoteChatToTop(idx);
-
-                if (mediaType != MediaType::NONE && !mediaFileId.isEmpty() && !savedAudioPath.isEmpty()) {
-                    mediaToDownload.push_back({chatId, mediaFileId, savedAudioPath});
-                }
-
-                if (g_currentView == AppView::CONVERSATION_THREAD && g_selectedChatIndex == 0) {
-                    g_threadScrollOffset = 0;
-                }
-                receivedNewIncoming = true;
-            }
-        } else {
-            g_statusBadge = "API ERR";
+        // If the incoming message belongs to the chat we are actively viewing right now, scroll to bottom
+        if (g_currentView == AppView::CONVERSATION_THREAD && ev.chatId == activeChatBefore) {
+            g_threadScrollOffset = 0;
         }
-        doc.clear();
-    } else if (httpCode > 0) {
-        g_statusBadge = "HTTP " + String(httpCode);
-    } else {
-        g_statusBadge = "SYNC..";
     }
 
-    https.end();
-
-    // Download & permanently store any newly received audio files onto the MicroSD card
-    for (const auto& item : mediaToDownload) {
-        downloadTelegramMediaFile(item.fileId, item.destPath.c_str());
-    }
-
-    if (receivedNewIncoming) {
-        saveContactsIndexToSD();
-        // Always play notification sound even when screen is off so user knows a message arrived
-        playNotificationChime();
-        g_uiDirty = true;
-    }
-
-    return receivedNewIncoming;
+    saveContactsIndexToSD();
+    playNotificationChime();
+    g_uiDirty = true;
 }
 
-/**
- * @brief Sends a text message to the specified Telegram chat_id.
- */
+// ============================================================================
+// CORE 1 OUTGOING SEND & MEDIA DOWNLOAD (CALLED ONLY ON EXPLICIT USER ACTION)
+// ============================================================================
 bool sendTelegramMessage(int64_t chatId, const String& text) {
-    if (WiFi.status() != WL_CONNECTED || text.isEmpty()) {
-        return false;
-    }
+    if (WiFi.status() != WL_CONNECTED || text.isEmpty()) return false;
+
+    g_pauseBackgroundPoll = true;
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(5);
 
     HTTPClient https;
-    https.setReuse(true);
     https.setTimeout(5000);
 
-    String url = buildBotApiUrl("sendMessage");
-    if (!https.begin(g_tlsClient, url)) {
-        return false;
-    }
-
-    https.addHeader("Content-Type", "application/json");
-
-    String requestBody;
-    {
-        DynamicJsonDocument reqDoc(JSON_SEND_DOC_SIZE);
-        reqDoc["chat_id"] = chatId;
-        reqDoc["text"]    = text;
-        serializeJson(reqDoc, requestBody);
-        reqDoc.clear();
-    }
-
-    int httpCode = https.POST(requestBody);
     bool success = false;
+    String url = buildBotApiUrl("sendMessage");
+    if (https.begin(client, url)) {
+        https.addHeader("Content-Type", "application/json");
 
-    if (httpCode == HTTP_CODE_OK) {
-        DynamicJsonDocument respDoc(JSON_SEND_DOC_SIZE);
-        DeserializationError err = deserializeJson(respDoc, https.getStream());
-        if (!err && (respDoc["ok"] | false)) {
-            success = true;
+        String requestBody;
+        {
+            DynamicJsonDocument reqDoc(JSON_SEND_DOC_SIZE);
+            reqDoc["chat_id"] = chatId;
+            reqDoc["text"]    = text;
+            serializeJson(reqDoc, requestBody);
+            reqDoc.clear();
         }
-        respDoc.clear();
+
+        int httpCode = https.POST(requestBody);
+        if (httpCode == HTTP_CODE_OK) {
+            DynamicJsonDocument respDoc(JSON_SEND_DOC_SIZE);
+            if (deserializeJson(respDoc, https.getStream()) == DeserializationError::Ok &&
+                (respDoc["ok"] | false)) {
+                success = true;
+            }
+            respDoc.clear();
+        }
+        https.end();
     }
 
-    https.end();
+    g_pauseBackgroundPoll = false;
     return success;
 }
 
 /**
- * @brief Uploads a recorded WAV file from MicroSD to Telegram Bot API via multipart/form-data (`sendVoice`).
+ * @brief Uploads a 16-bit PCM WAV file from MicroSD to Telegram via `/sendAudio`.
  */
-bool sendTelegramVoiceFile(int64_t chatId, const char* sdFilePath, uint16_t durationSec, String& outFileId) {
-    if (WiFi.status() != WL_CONNECTED || !SD.exists(sdFilePath)) {
-        return false;
-    }
+bool sendTelegramWavAudio(int64_t chatId, const char* sdFilePath, uint16_t durationSec, String& outFileId) {
+    if (WiFi.status() != WL_CONNECTED || !SD.exists(sdFilePath)) return false;
 
     File audioFile = SD.open(sdFilePath, FILE_READ);
     if (!audioFile) return false;
@@ -1088,16 +1032,18 @@ bool sendTelegramVoiceFile(int64_t chatId, const char* sdFilePath, uint16_t dura
         return false;
     }
 
+    g_pauseBackgroundPoll = true;
     WiFiClientSecure uploadClient;
     uploadClient.setInsecure();
     uploadClient.setTimeout(10);
 
     if (!uploadClient.connect("api.telegram.org", 443)) {
         audioFile.close();
+        g_pauseBackgroundPoll = false;
         return false;
     }
 
-    const String boundary = "----TeleputerVoiceBoundary7MA4YWxkTrZu0gW";
+    const String boundary = "----TeleputerAudioBoundary7MA4YWxkTrZu0gW";
     String headPart = "--" + boundary + "\r\n";
     headPart += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
     headPart += String(chatId) + "\r\n";
@@ -1107,15 +1053,23 @@ bool sendTelegramVoiceFile(int64_t chatId, const char* sdFilePath, uint16_t dura
     headPart += String(durationSec) + "\r\n";
 
     headPart += "--" + boundary + "\r\n";
-    headPart += "Content-Disposition: form-data; name=\"voice\"; filename=\"voice.wav\"\r\n";
+    headPart += "Content-Disposition: form-data; name=\"title\"\r\n\r\n";
+    headPart += "Voice Message\r\n";
+
+    headPart += "--" + boundary + "\r\n";
+    headPart += "Content-Disposition: form-data; name=\"performer\"\r\n\r\n";
+    headPart += "Teleputer ADV\r\n";
+
+    headPart += "--" + boundary + "\r\n";
+    headPart += "Content-Disposition: form-data; name=\"audio\"; filename=\"voice.wav\"\r\n";
     headPart += "Content-Type: audio/wav\r\n\r\n";
 
     String tailPart = "\r\n--" + boundary + "--\r\n";
     size_t totalContentLen = headPart.length() + fileSize + tailPart.length();
 
-    String reqHeader = "POST /bot" + g_config.botToken + "/sendVoice HTTP/1.1\r\n";
+    String reqHeader = "POST /bot" + g_config.botToken + "/sendAudio HTTP/1.1\r\n";
     reqHeader += "Host: api.telegram.org\r\n";
-    reqHeader += "User-Agent: Teleputer-ADV/2.1\r\n";
+    reqHeader += "User-Agent: Teleputer-ADV/3.1\r\n";
     reqHeader += "Connection: close\r\n";
     reqHeader += "Content-Type: multipart/form-data; boundary=" + boundary + "\r\n";
     reqHeader += "Content-Length: " + String(totalContentLen) + "\r\n\r\n";
@@ -1151,20 +1105,109 @@ bool sendTelegramVoiceFile(int64_t chatId, const char* sdFilePath, uint16_t dura
         if (!err && (respDoc["ok"] | false)) {
             ok = true;
             JsonObject res = respDoc["result"];
-            if (!res["voice"].isNull()) {
-                outFileId = String(res["voice"]["file_id"] | "");
-            } else if (!res["audio"].isNull()) {
+            if (!res["audio"].isNull()) {
                 outFileId = String(res["audio"]["file_id"] | "");
+            } else if (!res["voice"].isNull()) {
+                outFileId = String(res["voice"]["file_id"] | "");
             }
         }
         respDoc.clear();
     }
     uploadClient.stop();
+    g_pauseBackgroundPoll = false;
     return ok;
 }
 
+bool downloadTelegramMediaFile(const String& fileId, const char* destPath) {
+    if (WiFi.status() != WL_CONNECTED || fileId.isEmpty()) return false;
+
+    ensureStorageDirectories();
+    g_pauseBackgroundPoll = true;
+
+    WiFiClientSecure dlClient;
+    dlClient.setInsecure();
+    dlClient.setTimeout(6);
+
+    HTTPClient https;
+    https.setReuse(true);
+    https.setTimeout(6000);
+
+    String getFileUrl = buildBotApiUrl("getFile") + "?file_id=" + fileId;
+    if (!https.begin(dlClient, getFileUrl)) {
+        g_pauseBackgroundPoll = false;
+        return false;
+    }
+
+    int code = https.GET();
+    String remoteFilePath = "";
+    if (code == HTTP_CODE_OK) {
+        DynamicJsonDocument doc(JSON_SEND_DOC_SIZE);
+        if (deserializeJson(doc, https.getStream()) == DeserializationError::Ok && (doc["ok"] | false)) {
+            remoteFilePath = String(doc["result"]["file_path"] | "");
+        }
+        doc.clear();
+    }
+    https.end();
+
+    if (remoteFilePath.isEmpty()) {
+        g_pauseBackgroundPoll = false;
+        return false;
+    }
+
+    String fileUrl = "https://api.telegram.org/file/bot" + g_config.botToken + "/" + remoteFilePath;
+    String dlUrl   = g_config.transcodeUrl.isEmpty()
+                     ? fileUrl
+                     : (g_config.transcodeUrl + "?url=" + fileUrl);
+
+    if (!https.begin(dlClient, dlUrl)) {
+        g_pauseBackgroundPoll = false;
+        return false;
+    }
+
+    int dlCode = https.GET();
+    if (dlCode != HTTP_CODE_OK) {
+        https.end();
+        g_pauseBackgroundPoll = false;
+        return false;
+    }
+
+    if (SD.exists(destPath)) SD.remove(destPath);
+    File out = SD.open(destPath, FILE_WRITE);
+    if (!out) {
+        https.end();
+        g_pauseBackgroundPoll = false;
+        return false;
+    }
+
+    WiFiClient* stream = https.getStreamPtr();
+    int remaining = https.getSize();
+    uint8_t buf[1024];
+    unsigned long lastReadMs = millis();
+
+    while (https.connected() && (remaining > 0 || remaining == -1)) {
+        size_t avail = stream->available();
+        if (avail > 0) {
+            size_t toRead = (avail > sizeof(buf)) ? sizeof(buf) : avail;
+            int readBytes = stream->readBytes(buf, toRead);
+            if (readBytes > 0) {
+                out.write(buf, readBytes);
+                if (remaining > 0) remaining -= readBytes;
+                lastReadMs = millis();
+            }
+        } else {
+            if (millis() - lastReadMs > 4000UL) break;
+            delay(5);
+        }
+    }
+
+    out.close();
+    https.end();
+    g_pauseBackgroundPoll = false;
+    return true;
+}
+
 // ============================================================================
-// VOICE RECORDING & VOICE/VIDEO-AUDIO PLAYBACK ENGINE
+// DOUBLE-BUFFERED DMA VOICE RECORDING & GAPLESS PLAYBACK ENGINE
 // ============================================================================
 void renderUI(); // Forward declaration
 
@@ -1179,7 +1222,7 @@ bool startVoiceRecording() {
     g_recordFile = SD.open(g_activeRecordPath.c_str(), FILE_WRITE);
     if (!g_recordFile) {
         playErrorChime();
-        g_statusBadge = "SD ERR";
+        g_netStatusBadge = "SD ERR";
         g_uiDirty = true;
         return false;
     }
@@ -1188,22 +1231,55 @@ bool startVoiceRecording() {
     WavHeader hdr;
     g_recordFile.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(WavHeader));
 
+    g_pauseBackgroundPoll = true;
     ensureMicActive();
+
+    memset(g_audioDmaBuf, 0, sizeof(g_audioDmaBuf));
     g_isRecordingVoice  = true;
     g_recordStartMs     = millis();
     g_recordedDataBytes = 0;
-    g_statusBadge       = "REC";
-    g_uiDirty           = true;
+    g_recActiveSlot     = 0;
+    g_recDcEstimate     = 0;
+
+    // Prime both DMA slots so slot 0 is recording while slot 1 is queued behind it
+    M5Cardputer.Mic.record(g_audioDmaBuf[0], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
+    M5Cardputer.Mic.record(g_audioDmaBuf[1], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
+
+    g_netStatusBadge = "REC";
+    g_uiDirty        = true;
     return true;
 }
 
+/**
+ * @brief Waits until the oldest DMA slot (`g_recActiveSlot`) has finished recording
+ *        (`Mic.isRecording() < 2`), amplifies & DC-filters the completed samples,
+ *        writes them to the WAV file on MicroSD, and re-queues that slot to `Mic.record()`.
+ */
 void pumpVoiceRecording() {
     if (!g_isRecordingVoice) return;
 
-    if (M5Cardputer.Mic.record(g_micBuffer, VOICE_CHUNK_SAMPLES, VOICE_SAMPLE_RATE)) {
-        size_t bytesToWrite = VOICE_CHUNK_SAMPLES * sizeof(int16_t);
-        g_recordFile.write(reinterpret_cast<const uint8_t*>(g_micBuffer), bytesToWrite);
+    // When isRecording() drops below 2, `g_recActiveSlot` has finished DMA transfer!
+    if (M5Cardputer.Mic.isRecording() < 2) {
+        int completedSlot = g_recActiveSlot;
+        int16_t* samples  = g_audioDmaBuf[completedSlot];
+
+        // Remove DC offset and apply 4x clean speech gain with saturation guard
+        for (size_t i = 0; i < AUDIO_DMA_SAMPLES; ++i) {
+            int32_t raw = samples[i];
+            g_recDcEstimate = (g_recDcEstimate * 63 + raw) >> 6;
+            int32_t ac = (raw - g_recDcEstimate) * 4;
+            if (ac > 32767)  ac = 32767;
+            if (ac < -32768) ac = -32768;
+            samples[i] = static_cast<int16_t>(ac);
+        }
+
+        size_t bytesToWrite = AUDIO_DMA_SAMPLES * sizeof(int16_t);
+        g_recordFile.write(reinterpret_cast<const uint8_t*>(samples), bytesToWrite);
         g_recordedDataBytes += bytesToWrite;
+
+        // Re-queue this slot behind the currently active slot
+        M5Cardputer.Mic.record(g_audioDmaBuf[completedSlot], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
+        g_recActiveSlot ^= 1;
     }
 
     static unsigned long lastRecUiUpdate = 0;
@@ -1216,10 +1292,15 @@ void pumpVoiceRecording() {
 void stopAndSendVoiceRecording(bool cancelOnly = false) {
     if (!g_isRecordingVoice) return;
 
+    // Wait for remaining queued DMA slots to finish
+    while (M5Cardputer.Mic.isRecording()) {
+        delay(1);
+    }
+
     uint32_t elapsedSec = (millis() - g_recordStartMs + 500) / 1000;
     if (elapsedSec < 1) elapsedSec = 1;
 
-    // Finalize WAV header sizes on the permanent SD file
+    // Finalize 44-byte RIFF WAV header
     WavHeader finalHdr;
     finalHdr.dataSize    = g_recordedDataBytes;
     finalHdr.overallSize = 36 + g_recordedDataBytes;
@@ -1234,126 +1315,151 @@ void stopAndSendVoiceRecording(bool cancelOnly = false) {
         if (!g_activeRecordPath.isEmpty() && SD.exists(g_activeRecordPath.c_str())) {
             SD.remove(g_activeRecordPath.c_str());
         }
-        g_activeRecordPath = "";
-        g_statusBadge = "REC CANC";
-        g_uiDirty = true;
+        g_activeRecordPath    = "";
+        g_pauseBackgroundPoll = false;
+        g_netStatusBadge      = "REC CANC";
+        g_uiDirty             = true;
         return;
     }
 
     int64_t targetChatId = g_chats[g_selectedChatIndex].chatId;
     g_isSendingMessage   = true;
-    g_statusBadge        = "UPLOADING";
+    g_netStatusBadge     = "UPLOADING";
     g_uiDirty            = true;
     renderUI();
 
     String uploadedFileId = "";
-    bool sentOk = sendTelegramVoiceFile(targetChatId, g_activeRecordPath.c_str(), elapsedSec, uploadedFileId);
+    bool sentOk = sendTelegramWavAudio(targetChatId, g_activeRecordPath.c_str(), elapsedSec, uploadedFileId);
     if (sentOk) {
         playSendChime();
         String label = "[Voice Sent " + String(elapsedSec) + "s] (Fn+P Play)";
         appendMessageToChat(g_selectedChatIndex, true, label, millis() / 1000,
                             MediaType::VOICE, uploadedFileId, elapsedSec, g_activeRecordPath);
-        promoteChatToTop(g_selectedChatIndex);
-        g_selectedChatIndex  = 0;
+        promoteChatToTop(g_selectedChatIndex, true);
         g_threadScrollOffset = 0;
-        g_statusBadge        = "LIVE";
+        g_netStatusBadge     = "LIVE";
         saveContactsIndexToSD();
     } else {
         playErrorChime();
-        g_statusBadge = "VOICE ERR";
+        g_netStatusBadge = "VOICE ERR";
     }
 
-    g_activeRecordPath = "";
-    g_isSendingMessage = false;
-    g_uiDirty = true;
+    g_activeRecordPath    = "";
+    g_isSendingMessage    = false;
+    g_pauseBackgroundPoll = false;
+    g_uiDirty             = true;
 }
 
 /**
- * @brief Plays a saved audio/video-note file from MicroSD over M5Cardputer.Speaker.
+ * @brief Plays a WAV file from MicroSD gaplessly using the 2-slot `g_audioDmaBuf` DMA queue.
  */
 void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool isVideoMessage) {
+    (void)expectedDurationSec;
+    (void)isVideoMessage;
+
     File f = SD.open(sdPath, FILE_READ);
-    if (!f) {
+    if (!f || f.size() < 44) {
+        if (f) f.close();
         playErrorChime();
         return;
     }
 
-    size_t fSize = f.size();
-    if (fSize < 44) {
+    char riffMagic[12] = {0};
+    f.readBytes(riffMagic, 12);
+    bool isRiffWave = (memcmp(riffMagic, "RIFF", 4) == 0 && memcmp(riffMagic + 8, "WAVE", 4) == 0);
+
+    if (!isRiffWave) {
         f.close();
+        g_netStatusBadge  = "NEED WAV";
+        g_audioPlayBanner = "Format is .oga/.mp4 (Need WAV)";
+        g_uiDirty         = true;
+        renderUI();
         playErrorChime();
+        delay(1200);
         return;
     }
 
+    uint16_t numChannels   = 1;
+    uint32_t sampleRate    = VOICE_SAMPLE_RATE;
+    uint16_t bitsPerSample = 16;
+    uint32_t dataOffset    = 44;
+    uint32_t dataSize      = f.size() - 44;
+
+    while (f.available() >= 8) {
+        char chunkId[4];
+        uint32_t chunkLen = 0;
+        f.readBytes(chunkId, 4);
+        f.readBytes(reinterpret_cast<char*>(&chunkLen), 4);
+
+        if (memcmp(chunkId, "fmt ", 4) == 0 && chunkLen >= 16) {
+            uint16_t audioFmt   = 1;
+            uint32_t byteRate   = 0;
+            uint16_t blockAlign = 0;
+            f.readBytes(reinterpret_cast<char*>(&audioFmt), 2);
+            f.readBytes(reinterpret_cast<char*>(&numChannels), 2);
+            f.readBytes(reinterpret_cast<char*>(&sampleRate), 4);
+            f.readBytes(reinterpret_cast<char*>(&byteRate), 4);
+            f.readBytes(reinterpret_cast<char*>(&blockAlign), 2);
+            f.readBytes(reinterpret_cast<char*>(&bitsPerSample), 2);
+            if (chunkLen > 16) {
+                f.seek(f.position() + (chunkLen - 16));
+            }
+        } else if (memcmp(chunkId, "data", 4) == 0) {
+            dataOffset = f.position();
+            dataSize   = chunkLen;
+            break;
+        } else {
+            f.seek(f.position() + chunkLen);
+        }
+    }
+
+    f.seek(dataOffset);
+    if (sampleRate < 4000 || sampleRate > 48000) {
+        sampleRate = VOICE_SAMPLE_RATE;
+    }
+
+    g_pauseBackgroundPoll = true;
     ensureSpeakerActive();
-    M5Cardputer.Speaker.setVolume(200);
+    M5Cardputer.Speaker.setVolume(255);
 
-    char magic[4] = {0};
-    f.readBytes(magic, 4);
+    int bufIdx = 0;
+    uint32_t bytesLeft = dataSize;
 
-    if (memcmp(magic, "RIFF", 4) == 0) {
-        f.seek(0);
-        WavHeader hdr;
-        f.readBytes(reinterpret_cast<char*>(&hdr), sizeof(WavHeader));
-        uint32_t sampleRate = (hdr.sampleRate >= 4000 && hdr.sampleRate <= 48000) ? hdr.sampleRate : VOICE_SAMPLE_RATE;
+    while (bytesLeft > 0) {
+        size_t maxBytes  = sizeof(g_audioDmaBuf[0]);
+        size_t toRead    = (bytesLeft < maxBytes) ? bytesLeft : maxBytes;
+        size_t bytesRead = f.read(reinterpret_cast<uint8_t*>(g_audioDmaBuf[bufIdx]), toRead);
+        if (bytesRead == 0) break;
+        bytesLeft -= bytesRead;
 
-        int16_t pcmBuf[2][VOICE_CHUNK_SAMPLES];
-        int bufIdx = 0;
+        size_t samplesRead = bytesRead / sizeof(int16_t);
+        if (numChannels == 2) samplesRead /= 2;
+        if (samplesRead == 0) break;
 
-        while (f.available()) {
-            size_t bytesRead = f.read(reinterpret_cast<uint8_t*>(pcmBuf[bufIdx]), sizeof(pcmBuf[0]));
-            size_t samplesRead = bytesRead / sizeof(int16_t);
-            if (samplesRead == 0) break;
-
-            M5Cardputer.Speaker.playRaw(pcmBuf[bufIdx], samplesRead, sampleRate, false, 1, 0);
-            while (M5Cardputer.Speaker.isPlaying(0)) {
-                M5Cardputer.update();
-                delay(2);
-            }
-            bufIdx ^= 1;
+        // Wait only while BOTH DMA slots are occupied (isPlaying(0) == 2)
+        while (M5Cardputer.Speaker.isPlaying(0) > 1) {
+            delay(1);
         }
-    } else {
-        const uint32_t outRate = 8000;
-        const uint32_t playSec = (expectedDurationSec > 0 && expectedDurationSec <= 20) ? expectedDurationSec : 3;
-        const size_t totalChunks = (playSec * outRate) / VOICE_CHUNK_SAMPLES;
 
-        f.seek(0);
-        int16_t synthBuf[VOICE_CHUNK_SAMPLES];
-        uint8_t netBytes[64];
-        int32_t lpState = 0;
+        M5Cardputer.Speaker.playRaw(
+            g_audioDmaBuf[bufIdx],
+            samplesRead,
+            sampleRate,
+            (numChannels == 2),
+            1,
+            0
+        );
+        bufIdx ^= 1;
+    }
 
-        for (size_t c = 0; c < totalChunks; ++c) {
-            if (!f.available()) f.seek(0);
-            size_t n = f.read(netBytes, sizeof(netBytes));
-            uint16_t energy = 0;
-            for (size_t i = 0; i < n; ++i) {
-                energy += abs(static_cast<int>(netBytes[i]) - 128);
-            }
-            int16_t amp = static_cast<int16_t>((energy / (n ? n : 1)) * 45);
-
-            for (size_t s = 0; s < VOICE_CHUNK_SAMPLES; ++s) {
-                uint8_t b = netBytes[s % (n ? n : 1)];
-                int32_t raw = ((static_cast<int32_t>(b) - 128) * amp) / 64;
-                lpState = (lpState * 3 + raw) / 4;
-                synthBuf[s] = static_cast<int16_t>(lpState);
-            }
-
-            M5Cardputer.Speaker.playRaw(synthBuf, VOICE_CHUNK_SAMPLES, outRate, false, 1, 0);
-            while (M5Cardputer.Speaker.isPlaying(0)) {
-                M5Cardputer.update();
-                delay(2);
-            }
-        }
+    while (M5Cardputer.Speaker.isPlaying(0)) {
+        delay(2);
     }
 
     f.close();
-    (void)isVideoMessage;
+    g_pauseBackgroundPoll = false;
 }
 
-/**
- * @brief Plays the most recent Voice or Video (Audio-Only) message in the active conversation.
- *        Plays directly from the permanent MicroSD file if already saved, or downloads & saves it.
- */
 void playLatestChatMedia() {
     if (g_chats.empty() || g_isPlayingAudio || g_isRecordingVoice || g_isSendingMessage) return;
 
@@ -1369,44 +1475,42 @@ void playLatestChatMedia() {
 
     if (!targetMsg) {
         playErrorChime();
-        g_statusBadge = "NO AUDIO";
+        g_netStatusBadge = "NO AUDIO";
         g_uiDirty = true;
         return;
     }
 
     bool isVideo = (targetMsg->mediaType == MediaType::VIDEO_AUDIO_ONLY);
-    g_isPlayingAudio = true;
+    g_isPlayingAudio  = true;
     g_audioPlayBanner = isVideo ? "Video Msg: Audio Only..." : "Playing Voice Msg...";
-    g_uiDirty = true;
+    g_uiDirty         = true;
     renderUI();
 
-    // 1. Check if audio file is already saved on the MicroSD card
     if (!targetMsg->localAudioPath.isEmpty() && SD.exists(targetMsg->localAudioPath.c_str())) {
         playAudioFileFromSD(targetMsg->localAudioPath.c_str(), targetMsg->mediaDurationSec, isVideo);
     } else if (!targetMsg->mediaFileId.isEmpty()) {
-        // 2. Otherwise download it to a permanent path in /tg_audio/ and update SD history
         if (targetMsg->localAudioPath.isEmpty()) {
-            const char* ext = isVideo ? ".mp4" : ".oga";
+            const char* ext = isVideo ? ".mp4" : ".wav";
             targetMsg->localAudioPath = generateUniqueAudioFilePath(chat.chatId, targetMsg->isOutgoing, ext);
         }
 
         g_audioPlayBanner = isVideo ? "DL Video Audio..." : "DL Voice Msg...";
-        g_uiDirty = true;
+        g_uiDirty         = true;
         renderUI();
 
         if (downloadTelegramMediaFile(targetMsg->mediaFileId, targetMsg->localAudioPath.c_str())) {
             rewriteFullChatHistoryToSD(chat);
             g_audioPlayBanner = isVideo ? "Video Note (Audio Only)" : "Playing Voice Note...";
-            g_uiDirty = true;
+            g_uiDirty         = true;
             renderUI();
             playAudioFileFromSD(targetMsg->localAudioPath.c_str(), targetMsg->mediaDurationSec, isVideo);
         } else {
             playErrorChime();
-            g_statusBadge = "DL FAIL";
+            g_netStatusBadge = "DL FAIL";
         }
     } else {
         playErrorChime();
-        g_statusBadge = "NO FILE";
+        g_netStatusBadge = "NO FILE";
     }
 
     g_isPlayingAudio  = false;
@@ -1434,12 +1538,11 @@ void renderViewAChatList() {
     String countStr = "[" + String(g_chats.size()) + "]";
     canvas.drawString(countStr, 66, 5);
 
-    // Wi-Fi & Poll Status Pill
     bool wifiOk = (WiFi.status() == WL_CONNECTED);
     uint16_t dotCol = wifiOk ? COL_STATUS_OK : COL_STATUS_ERR;
     canvas.fillCircle(SCREEN_WIDTH - 54, 8, 3, dotCol);
     canvas.setTextColor(COL_TEXT_SECONDARY);
-    canvas.drawString(g_statusBadge, SCREEN_WIDTH - 47, 5);
+    canvas.drawString(g_netStatusBadge, SCREEN_WIDTH - 47, 5);
 
     // 2. Left 40% Panel (96px wide): Scrollable Chat List (up to 5 visible rows)
     canvas.fillRect(0, VIEW_A_BODY_Y, VIEW_A_LEFT_WIDTH, VIEW_A_BODY_HEIGHT, COL_BG_PANEL_LEFT);
@@ -1540,7 +1643,6 @@ void renderViewAChatList() {
             std::vector<String> snippetLines;
             wrapTextToLines(canvas, fullSnippet, rightW - 12, snippetLines);
 
-            // Consistent color rule: grey for received, blue for sent
             canvas.setTextColor(lastMsg.isOutgoing ? COL_TEXT_OUTGOING : COL_TEXT_INCOMING);
 
             int maxPreviewLines = 4;
@@ -1597,7 +1699,7 @@ void renderViewBConversation() {
         const ContactChat& chat = g_chats[g_selectedChatIndex];
 
         std::vector<WrappedMessageLine> allLines;
-        const int maxBubbleTextWidth = SCREEN_WIDTH - 16; // 224px safe text width
+        const int maxBubbleTextWidth = SCREEN_WIDTH - 16;
 
         for (const auto& msg : chat.messages) {
             std::vector<String> msgLines;
@@ -1694,20 +1796,25 @@ void renderViewBConversation() {
 
 void renderUI() {
     if (!g_uiDirty || g_screenState == ScreenPowerState::OFF) return;
+    g_uiDirty = false;
     if (g_currentView == AppView::CHAT_LIST_HUB) {
         renderViewAChatList();
     } else {
         renderViewBConversation();
     }
-    g_uiDirty = false;
 }
 
 // ============================================================================
-// KEYBOARD INPUT HANDLER (NON-BLOCKING)
+// KEYBOARD INPUT HANDLER (DEBOUNCED, NON-BLOCKING)
 // ============================================================================
 void handlePhysicalKeyboard() {
     if (!M5Cardputer.Keyboard.isChange()) return;
     if (!M5Cardputer.Keyboard.isPressed()) return;
+
+    // Hardware debounce guard to filter matrix switch bounce
+    unsigned long now = millis();
+    if (now - g_lastKeyPressMs < 30UL) return;
+    g_lastKeyPressMs = now;
 
     bool wasScreenOff = (g_screenState == ScreenPowerState::OFF);
     registerUserActivity();
@@ -1788,10 +1895,6 @@ void handlePhysicalKeyboard() {
     if (g_currentView == AppView::CONVERSATION_THREAD) {
         if (g_isSendingMessage || g_isPlayingAudio) return;
 
-        // Fn key combinations in View B:
-        // - Fn + ';' / Fn + '.' : Smooth 1-line scrolling through message history
-        // - Fn + 'R'            : Start recording voice message
-        // - Fn + 'P'            : Play latest voice or video (audio-only) message
         if (status.fn) {
             for (char c : status.word) {
                 if (c == ';') {
@@ -1841,15 +1944,14 @@ void handlePhysicalKeyboard() {
             if (sentOk) {
                 playSendChime();
                 appendMessageToChat(g_selectedChatIndex, true, payload, millis() / 1000);
-                promoteChatToTop(g_selectedChatIndex);
-                g_selectedChatIndex  = 0;
+                promoteChatToTop(g_selectedChatIndex, true);
                 g_threadScrollOffset = 0;
                 g_inputBuffer        = "";
                 saveContactsIndexToSD();
             } else {
                 playErrorChime();
-                g_statusBadge = "SEND FAIL";
-                g_inputBuffer = "";
+                g_netStatusBadge = "SEND FAIL";
+                g_inputBuffer    = "";
             }
 
             g_isSendingMessage = false;
@@ -1870,7 +1972,7 @@ void renderBootStatus(const String& stepText, const String& subText) {
     canvas.fillRect(0, 0, SCREEN_WIDTH, 22, COL_BG_HEADER);
     canvas.drawFastHLine(0, 21, SCREEN_WIDTH, COL_ACCENT_CYAN);
     canvas.setTextColor(COL_ACCENT_CYAN);
-    canvas.drawString("TELEPUTER ADV // VOICE & BOT", 8, 7);
+    canvas.drawString("TELEPUTER ADV // BOT CLIENT", 8, 7);
 
     canvas.drawRect(8, 32, SCREEN_WIDTH - 16, SCREEN_HEIGHT - 42, COL_BORDER);
     canvas.fillRect(9, 33, SCREEN_WIDTH - 18, SCREEN_HEIGHT - 44, COL_BG_PANEL_LEFT);
@@ -1888,8 +1990,7 @@ void connectToWiFi() {
     renderBootStatus("Connecting to Wi-Fi...", "SSID: " + g_config.wifiSsid);
 
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(true);
-    esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    WiFi.setSleep(false); // Prevent RF wake-spike glitches on keyboard matrix pins
     WiFi.begin(g_config.wifiSsid.c_str(), g_config.wifiPass.c_str());
 
     unsigned long startAttempt = millis();
@@ -1903,11 +2004,11 @@ void connectToWiFi() {
     }
 
     if (WiFi.status() == WL_CONNECTED) {
-        g_statusBadge = "LIVE";
+        g_netStatusBadge = "LIVE";
         renderBootStatus("Wi-Fi Connected!", "IP: " + WiFi.localIP().toString());
         delay(350);
     } else {
-        g_statusBadge = "OFFLINE";
+        g_netStatusBadge = "OFFLINE";
         playErrorChime();
         renderBootStatus("Wi-Fi Timeout (Retrying in BG)", "Check SSID/Password in SD config");
         delay(1200);
@@ -1915,7 +2016,7 @@ void connectToWiFi() {
 }
 
 // ============================================================================
-// ARDUINO SETUP & NON-BLOCKING MAIN LOOP
+// ARDUINO SETUP & NON-BLOCKING MAIN LOOP (CORE 1)
 // ============================================================================
 void setup() {
     auto cfg = M5.config();
@@ -1923,6 +2024,9 @@ void setup() {
 
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(BRIGHTNESS_AWAKE);
+    M5Cardputer.Speaker.setVolume(255);
+
+    g_queueMutex = xSemaphoreCreateMutex();
 
     canvas.setColorDepth(16);
     canvas.createSprite(SCREEN_WIDTH, SCREEN_HEIGHT);
@@ -1939,27 +2043,35 @@ void setup() {
     renderBootStatus("Loading Saved History...", "Reading /tg_chats & /tg_audio");
     loadContactsAndHistoriesFromSD();
 
-    // Configure persistent TLS client for low-power connection reuse
-    g_tlsClient.setInsecure();
-    g_tlsClient.setTimeout(4);
-
     connectToWiFi();
 
-    renderBootStatus("Syncing Telegram Bot API...", "Fetching recent messages...");
-    pollTelegramUpdates();
-
-    g_lastPollTimeMs     = millis();
     g_lastUserActivityMs = millis();
     g_uiDirty            = true;
     renderUI();
+
+    // Launch lightweight background polling task on Core 0 (never touches SPI/SD!)
+    xTaskCreatePinnedToCore(
+        backgroundPollTaskCore0,
+        "TeleputerPollTask",
+        8192,
+        nullptr,
+        1,
+        &g_pollTaskHandle,
+        0 // Core 0
+    );
 }
 
 void loop() {
-    // 1. Update physical keyboard matrix & hardware state continuously
+    // 1. Poll physical keyboard matrix on Core 1
     M5Cardputer.update();
     handlePhysicalKeyboard();
 
-    // 2. If recording voice, stream microphone PCM chunks to SD card
+    // 2. Drain any newly arrived messages from Core 0 background poller
+    if (!g_isRecordingVoice && !g_isPlayingAudio) {
+        processIncomingQueueCore1();
+    }
+
+    // 3. If recording voice, pump 512-sample ping-pong DMA buffers to SD card
     if (g_isRecordingVoice) {
         pumpVoiceRecording();
         if (millis() - g_recordStartMs >= (MAX_RECORD_SECONDS * 1000UL)) {
@@ -1967,31 +2079,13 @@ void loop() {
         }
     }
 
-    // 3. Manage 15s inactivity dim + 5s screen off power states
+    // 4. Manage 15s inactivity dim + 5s screen off power states
     updateScreenPowerState();
 
-    // 4. Render UI immediately whenever state changes and screen is awake/dimmed
+    // 5. Render UI immediately whenever state changes and screen is awake/dimmed
     if (g_uiDirty) {
         renderUI();
     }
 
-    // 5. Adaptive millis() timer:
-    //    - 1.5s near-instant polling when active/dimmed
-    //    - 10.0s battery-saving polling when screen is off
-    const unsigned long now = millis();
-    const unsigned long pollInterval = getCurrentPollIntervalMs();
-
-    if (!g_isSendingMessage && !g_isRecordingVoice && !g_isPlayingAudio &&
-        (now - g_lastPollTimeMs >= pollInterval)) {
-        g_lastPollTimeMs = now;
-
-        if (WiFi.status() != WL_CONNECTED) {
-            WiFi.reconnect();
-            g_statusBadge = "RECONN";
-            g_uiDirty = true;
-        } else {
-            pollTelegramUpdates();
-            g_uiDirty = true;
-        }
-    }
+    delay(5);
 }
