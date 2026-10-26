@@ -9,11 +9,11 @@
  *        - Multi-Stage Screen Timeout (15s dim -> 5s off) & Adaptive Polling (1.5s active / 10s sleep).
  *
  * Key Controls:
- *  - [TAB]       : Toggle between View A (Chat List Hub) and View B (Conversation Thread)
- *  - [;] / [.]   : Navigate chat list in View A (or [Fn + ;] / [Fn + .] to scroll chat in View B)
- *  - [ENTER]     : Open selected chat (View A) / Send typed message or finish voice recording (View B)
- *  - [Fn + R]    : Start / Stop & Send Voice Recording in View B
- *  - [Fn + P]    : Play latest Voice/Audio Message in View B
+ *  - [TAB]            : Toggle between View A (Chat List Hub) and View B (Conversation Thread)
+ *  - [;] / [.]        : Navigate chat list in View A
+ *  - [Fn + ;] / [Fn + .] : Move message selection Up / Down (and auto-scroll) in View B
+ *  - [ENTER]          : Open chat (View A) / Send text OR play .wav / view Photo when input is empty (View B)
+ *  - [Fn + R]         : Start / Stop & Send Voice Recording (.wav) in View B
  */
 
 #include <Arduino.h>
@@ -85,6 +85,8 @@ static const char* CONFIG_FILE_PATH    = "/tg_config.json";
 static const char* CONTACTS_INDEX_PATH = "/tg_contacts.json";
 static const char* CHAT_HISTORY_DIR    = "/tg_chats";
 static const char* AUDIO_STORAGE_DIR   = "/tg_audio";
+static const char* PHOTO_STORAGE_DIR   = "/tg_photos";
+static const char* TEMP_REC_RAW_PATH   = "/tg_audio/_rec_tmp.raw";
 
 // ============================================================================
 // DARK THEME COLOR PALETTE (RGB565)
@@ -93,7 +95,7 @@ static constexpr uint16_t COL_BG_DARK        = 0x0842; // #080810 Deep obsidian
 static constexpr uint16_t COL_BG_PANEL_LEFT  = 0x1084; // #101020 Left list background
 static constexpr uint16_t COL_BG_PANEL_RIGHT = 0x0863; // #080C18 Right preview background
 static constexpr uint16_t COL_BG_ROW_ALT     = 0x14A5; // #141428 Alternating row background (View A list)
-static constexpr uint16_t COL_BG_ROW_SEL     = 0x1D5E; // #182A70 Highlighted active chat row
+static constexpr uint16_t COL_BG_ROW_SEL     = 0x1D5E; // #182A70 Highlighted active chat / selected msg
 static constexpr uint16_t COL_BG_HEADER      = 0x10A6; // #101430 Header bar dark navy
 static constexpr uint16_t COL_BG_INPUT       = 0x18E7; // #181C38 Bottom input bar background
 static constexpr uint16_t COL_BG_INPUT_BUSY  = 0x2945; // Dimmed input when freezing/sending
@@ -125,9 +127,10 @@ enum class ScreenPowerState : uint8_t {
 
 enum class MediaType : uint8_t {
     NONE = 0,
-    VOICE,                 // Incoming/Outgoing voice note
-    AUDIO,                 // Audio file (.wav / .mp3)
-    VIDEO_AUDIO_ONLY       // Video message / Video note (plays audio only)
+    VOICE,                 // Voice note (.wav playable; .oga blocked on Cardputer)
+    AUDIO,                 // Audio file (.wav playable; non-wav blocked)
+    VIDEO_AUDIO_ONLY,      // Video message (blocked unless .wav)
+    PHOTO                  // Photo / Image (.jpg viewable fullscreen on Cardputer)
 };
 
 struct ChatMessage {
@@ -136,7 +139,7 @@ struct ChatMessage {
     uint32_t timestamp;    // Unix epoch or relative seconds
     MediaType mediaType    = MediaType::NONE;
     String mediaFileId     = "";
-    String localAudioPath  = ""; // Permanent file path on MicroSD (/tg_audio/...)
+    String localAudioPath  = ""; // Permanent file path on MicroSD (/tg_audio/... or /tg_photos/...)
     uint16_t mediaDurationSec = 0;
 };
 
@@ -158,7 +161,9 @@ struct AppConfig {
 };
 
 struct WrappedMessageLine {
+    int  msgIndex;
     bool isOutgoing;
+    bool isFirstLineOfMsg;
     bool isLastLineOfMsg;
     String lineText;
 };
@@ -215,22 +220,30 @@ static std::vector<ContactChat> g_chats;
 static int g_selectedChatIndex  = 0;
 static int g_listScrollOffset   = 0;
 static int g_threadScrollOffset = 0;
+static int g_selectedMsgIndex   = -1;
 
 static String g_inputBuffer      = "";
 static bool g_isSendingMessage   = false;
 static bool g_isPlayingAudio     = false;
+static bool g_isViewingPhoto     = false;
+static String g_activePhotoPath  = "";
+static String g_activePhotoTitle = "";
 static String g_audioPlayBanner  = "";
 static bool g_uiDirty            = true;
 
-// 2-slot Ping-Pong DMA Buffer (only 2 KB total!) used for both Recording & Playback
-static int16_t g_audioDmaBuf[2][AUDIO_DMA_SAMPLES];
+// 3-slot Ring DMA Buffer (only 3 KB total!) used for Recording & Playback
+static int16_t g_audioDmaBuf[3][AUDIO_DMA_SAMPLES];
 static bool g_isRecordingVoice        = false;
 static File g_recordFile;
 static String g_activeRecordPath      = "";
 static unsigned long g_recordStartMs  = 0;
 static uint32_t g_recordedDataBytes   = 0;
-static int g_recActiveSlot            = 0;
-static int32_t g_recDcEstimate        = 0;
+static uint32_t g_recWriteStep        = 0;
+static uint32_t g_recQueueStep        = 0;
+static int64_t  g_recSampleSum        = 0;
+static uint32_t g_recSampleCount      = 0;
+static int32_t  g_recMaxSample        = -32768;
+static int32_t  g_recMinSample        =  32767;
 static uint32_t g_audioFileCounter    = 0;
 
 // Timers & Debounce State
@@ -240,6 +253,26 @@ static unsigned long g_lastKeyPressMs     = 0;
 // ============================================================================
 // SPEAKER / MICROPHONE SWITCHING (PRESERVES M5CARDPUTER ADV ES8311 CODEC)
 // ============================================================================
+void boostCardputerAdvMicGain() {
+    if (M5.getBoard() == m5::board_t::board_M5CardputerADV) {
+        // M5Unified's internal callback sets Reg 0x14 = 0x10 (0dB PGA) and Reg 0x17 = 0xBF (0dB ADC).
+        // Boost ES8311 analog PGA gain (+30dB = 0x1A) and digital ADC volume (+16dB = 0xDF)
+        // on I2C address 0x18 after Mic.record() initializes the ES8311 codec:
+        M5.In_I2C.writeRegister8(0x18, 0x14, 0x1A, 400000);
+        M5.In_I2C.writeRegister8(0x18, 0x17, 0xDF, 400000);
+    }
+}
+
+void configureCardputerMicrophone() {
+    // Keep M5Unified's native channel & oversampling configuration intact so Mic_Class::_rec_task
+    // accumulates samples properly, and boost software magnification:
+    auto micCfg = M5Cardputer.Mic.config();
+    micCfg.sample_rate        = VOICE_SAMPLE_RATE;
+    micCfg.magnification      = 32;
+    micCfg.noise_filter_level = 0;
+    M5Cardputer.Mic.config(micCfg);
+}
+
 void ensureSpeakerActive() {
     if (M5Cardputer.Mic.isEnabled()) {
         while (M5Cardputer.Mic.isRecording()) {
@@ -259,6 +292,7 @@ void ensureMicActive() {
         M5Cardputer.Speaker.end();
     }
     if (!M5Cardputer.Mic.isEnabled()) {
+        configureCardputerMicrophone();
         M5Cardputer.Mic.begin();
     }
 }
@@ -438,12 +472,21 @@ String generateUniqueAudioFilePath(int64_t chatId, bool isOutgoing, const char* 
            String(millis()) + "_" + String(g_audioFileCounter) + ext;
 }
 
+String generateUniquePhotoFilePath(int64_t chatId) {
+    ++g_audioFileCounter;
+    return String(PHOTO_STORAGE_DIR) + "/img_" + String(chatId) + "_" +
+           String(millis()) + "_" + String(g_audioFileCounter) + ".jpg";
+}
+
 void ensureStorageDirectories() {
     if (!SD.exists(CHAT_HISTORY_DIR)) {
         SD.mkdir(CHAT_HISTORY_DIR);
     }
     if (!SD.exists(AUDIO_STORAGE_DIR)) {
         SD.mkdir(AUDIO_STORAGE_DIR);
+    }
+    if (!SD.exists(PHOTO_STORAGE_DIR)) {
+        SD.mkdir(PHOTO_STORAGE_DIR);
     }
 }
 
@@ -889,36 +932,54 @@ void backgroundPollTaskCore0(void* param) {
                                 ev.mediaFileId      = "";
                                 ev.mediaDurationSec = 0;
 
-                                if (!message["voice"].isNull()) {
+                                if (!message["photo"].isNull()) {
+                                    JsonArray photos = message["photo"].as<JsonArray>();
+                                    String bestFileId = "";
+                                    for (JsonObject p : photos) {
+                                        int w = p["width"] | 0;
+                                        int h = p["height"] | 0;
+                                        int fsize = p["file_size"] | 0;
+                                        String fid = String(p["file_id"] | "");
+                                        if (!fid.isEmpty()) {
+                                            if (bestFileId.isEmpty() || (w <= 320 && h <= 320 && fsize <= 32768)) {
+                                                bestFileId = fid;
+                                            }
+                                        }
+                                    }
+                                    ev.mediaFileId = bestFileId;
+                                    ev.mediaType   = MediaType::PHOTO;
+                                    String cap     = String(message["caption"] | "");
+                                    ev.text        = "[Photo - Enter to View]";
+                                    if (!cap.isEmpty()) ev.text += " " + cap;
+                                } else if (!message["voice"].isNull()) {
                                     JsonObject voiceObj = message["voice"];
                                     ev.mediaFileId      = String(voiceObj["file_id"] | "");
                                     ev.mediaDurationSec = voiceObj["duration"] | 1;
                                     ev.mediaType        = MediaType::VOICE;
-                                    ev.text             = "[Voice " + String(ev.mediaDurationSec) + "s] (Fn+P Play)";
+                                    ev.text             = "[Voice " + String(ev.mediaDurationSec) + "s]";
                                 } else if (!message["audio"].isNull()) {
                                     JsonObject audioObj = message["audio"];
                                     ev.mediaFileId      = String(audioObj["file_id"] | "");
                                     ev.mediaDurationSec = audioObj["duration"] | 1;
                                     ev.mediaType        = MediaType::AUDIO;
-                                    ev.text             = "[Audio " + String(ev.mediaDurationSec) + "s] (Fn+P Play)";
+                                    ev.text             = "[Audio " + String(ev.mediaDurationSec) + "s - Enter]";
                                 } else if (!message["video_note"].isNull()) {
                                     JsonObject vnObj    = message["video_note"];
                                     ev.mediaFileId      = String(vnObj["file_id"] | "");
                                     ev.mediaDurationSec = vnObj["duration"] | 1;
                                     ev.mediaType        = MediaType::VIDEO_AUDIO_ONLY;
-                                    ev.text             = "[Video Msg " + String(ev.mediaDurationSec) + "s - Audio Only] (Fn+P)";
+                                    ev.text             = "[Video Msg " + String(ev.mediaDurationSec) + "s]";
                                 } else if (!message["video"].isNull()) {
                                     JsonObject vidObj   = message["video"];
                                     ev.mediaFileId      = String(vidObj["file_id"] | "");
                                     ev.mediaDurationSec = vidObj["duration"] | 1;
                                     ev.mediaType        = MediaType::VIDEO_AUDIO_ONLY;
                                     String cap          = String(message["caption"] | "");
-                                    ev.text             = "[Video Msg " + String(ev.mediaDurationSec) + "s - Audio Only] (Fn+P)";
+                                    ev.text             = "[Video Msg " + String(ev.mediaDurationSec) + "s]";
                                     if (!cap.isEmpty()) ev.text += " " + cap;
                                 } else if (ev.text.isEmpty()) {
-                                    if (!message["photo"].isNull())        ev.text = "[Photo]";
-                                    else if (!message["sticker"].isNull()) ev.text = "[Sticker]";
-                                    else                                   ev.text = "[Media]";
+                                    if (!message["sticker"].isNull()) ev.text = "[Sticker]";
+                                    else                              ev.text = "[Media]";
                                 }
 
                                 ev.timestamp = message["date"] | static_cast<uint32_t>(millis() / 1000);
@@ -958,14 +1019,23 @@ void processIncomingQueueCore1() {
 
     for (const auto& ev : batch) {
         int idx = findOrCreateChat(ev.chatId, ev.displayName, ev.username);
+        bool wasAtBottom = true;
+        if (idx >= 0 && idx < static_cast<int>(g_chats.size()) && !g_chats[idx].messages.empty()) {
+            wasAtBottom = (g_selectedMsgIndex < 0 ||
+                           g_selectedMsgIndex >= static_cast<int>(g_chats[idx].messages.size()) - 1);
+        }
+
         appendMessageToChat(idx, false, ev.text, ev.timestamp,
                             ev.mediaType, ev.mediaFileId, ev.mediaDurationSec, "");
         // Promote incoming chat to top of the list, but NEVER switch the user's active selection!
         promoteChatToTop(idx, false);
 
-        // If the incoming message belongs to the chat we are actively viewing right now, scroll to bottom
+        // If the incoming message belongs to the chat we are actively viewing right now
         if (g_currentView == AppView::CONVERSATION_THREAD && ev.chatId == activeChatBefore) {
-            g_threadScrollOffset = 0;
+            if (wasAtBottom && g_selectedChatIndex >= 0 && g_selectedChatIndex < static_cast<int>(g_chats.size())) {
+                g_selectedMsgIndex   = static_cast<int>(g_chats[g_selectedChatIndex].messages.size()) - 1;
+                g_threadScrollOffset = 0;
+            }
         }
     }
 
@@ -1207,29 +1277,41 @@ bool downloadTelegramMediaFile(const String& fileId, const char* destPath) {
 }
 
 // ============================================================================
-// DOUBLE-BUFFERED DMA VOICE RECORDING & GAPLESS PLAYBACK ENGINE
+// SEQUENTIAL WAV VOICE RECORDING, .WAV-ONLY PLAYBACK & JPEG PHOTO VIEWER
 // ============================================================================
 void renderUI(); // Forward declaration
 
+static void accumulateRecordingStats(const int16_t* samples, size_t count, uint32_t sampleStartIndex) {
+    const uint32_t skipSamples = (VOICE_SAMPLE_RATE * 80) / 1000; // Skip first 80ms codec power-on pop
+    for (size_t i = 0; i < count; ++i) {
+        if (sampleStartIndex + i >= skipSamples) {
+            int32_t v = samples[i];
+            g_recSampleSum += v;
+            ++g_recSampleCount;
+            if (v > g_recMaxSample) g_recMaxSample = v;
+            if (v < g_recMinSample) g_recMinSample = v;
+        }
+    }
+}
+
 bool startVoiceRecording() {
-    if (g_isRecordingVoice || g_isSendingMessage || g_isPlayingAudio) return false;
+    if (g_isRecordingVoice || g_isSendingMessage || g_isPlayingAudio || g_isViewingPhoto) return false;
     if (g_chats.empty()) return false;
 
     ensureStorageDirectories();
     int64_t targetChatId = g_chats[g_selectedChatIndex].chatId;
     g_activeRecordPath = generateUniqueAudioFilePath(targetChatId, true, ".wav");
 
-    g_recordFile = SD.open(g_activeRecordPath.c_str(), FILE_WRITE);
+    if (SD.exists(TEMP_REC_RAW_PATH)) {
+        SD.remove(TEMP_REC_RAW_PATH);
+    }
+    g_recordFile = SD.open(TEMP_REC_RAW_PATH, FILE_WRITE);
     if (!g_recordFile) {
         playErrorChime();
         g_netStatusBadge = "SD ERR";
         g_uiDirty = true;
         return false;
     }
-
-    // Write placeholder 44-byte WAV header
-    WavHeader hdr;
-    g_recordFile.write(reinterpret_cast<const uint8_t*>(&hdr), sizeof(WavHeader));
 
     g_pauseBackgroundPoll = true;
     ensureMicActive();
@@ -1238,48 +1320,47 @@ bool startVoiceRecording() {
     g_isRecordingVoice  = true;
     g_recordStartMs     = millis();
     g_recordedDataBytes = 0;
-    g_recActiveSlot     = 0;
-    g_recDcEstimate     = 0;
+    g_recWriteStep      = 0;
+    g_recQueueStep      = 2;
+    g_recSampleSum      = 0;
+    g_recSampleCount    = 0;
+    g_recMaxSample      = -32768;
+    g_recMinSample      =  32767;
 
-    // Prime both DMA slots so slot 0 is recording while slot 1 is queued behind it
+    // Prime 2 DMA slots in Mic_Class queue while 3rd slot stands by for lock-free SD writing
     M5Cardputer.Mic.record(g_audioDmaBuf[0], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
     M5Cardputer.Mic.record(g_audioDmaBuf[1], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
+
+    // Wait briefly for Mic_Class::_rec_task to run M5Unified's ES8311 enable callback, then boost PGA/ADC gain
+    delay(15);
+    boostCardputerAdvMicGain();
 
     g_netStatusBadge = "REC";
     g_uiDirty        = true;
     return true;
 }
 
-/**
- * @brief Waits until the oldest DMA slot (`g_recActiveSlot`) has finished recording
- *        (`Mic.isRecording() < 2`), amplifies & DC-filters the completed samples,
- *        writes them to the WAV file on MicroSD, and re-queues that slot to `Mic.record()`.
- */
 void pumpVoiceRecording() {
     if (!g_isRecordingVoice) return;
 
-    // When isRecording() drops below 2, `g_recActiveSlot` has finished DMA transfer!
-    if (M5Cardputer.Mic.isRecording() < 2) {
-        int completedSlot = g_recActiveSlot;
-        int16_t* samples  = g_audioDmaBuf[completedSlot];
-
-        // Remove DC offset and apply 4x clean speech gain with saturation guard
-        for (size_t i = 0; i < AUDIO_DMA_SAMPLES; ++i) {
-            int32_t raw = samples[i];
-            g_recDcEstimate = (g_recDcEstimate * 63 + raw) >> 6;
-            int32_t ac = (raw - g_recDcEstimate) * 4;
-            if (ac > 32767)  ac = 32767;
-            if (ac < -32768) ac = -32768;
-            samples[i] = static_cast<int16_t>(ac);
+    while (M5Cardputer.Mic.isRecording() < 2) {
+        if (g_recWriteStep == 0) {
+            boostCardputerAdvMicGain();
         }
+        int nextQueueSlot = static_cast<int>(g_recQueueStep % 3);
+        int completedSlot = static_cast<int>(g_recWriteStep % 3);
+
+        // Immediately queue the free 3rd slot so DMA recording remains 100% continuous
+        M5Cardputer.Mic.record(g_audioDmaBuf[nextQueueSlot], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
+        ++g_recQueueStep;
+
+        uint32_t sampleStartIdx = g_recordedDataBytes / sizeof(int16_t);
+        accumulateRecordingStats(g_audioDmaBuf[completedSlot], AUDIO_DMA_SAMPLES, sampleStartIdx);
 
         size_t bytesToWrite = AUDIO_DMA_SAMPLES * sizeof(int16_t);
-        g_recordFile.write(reinterpret_cast<const uint8_t*>(samples), bytesToWrite);
+        g_recordFile.write(reinterpret_cast<const uint8_t*>(g_audioDmaBuf[completedSlot]), bytesToWrite);
         g_recordedDataBytes += bytesToWrite;
-
-        // Re-queue this slot behind the currently active slot
-        M5Cardputer.Mic.record(g_audioDmaBuf[completedSlot], AUDIO_DMA_SAMPLES, VOICE_SAMPLE_RATE);
-        g_recActiveSlot ^= 1;
+        ++g_recWriteStep;
     }
 
     static unsigned long lastRecUiUpdate = 0;
@@ -1289,31 +1370,107 @@ void pumpVoiceRecording() {
     }
 }
 
+/**
+ * @brief Builds a finalized RIFF WAVE (.wav) file sequentially from `TEMP_REC_RAW_PATH`
+ *        (writes the complete 44-byte `WavHeader` at byte 0 with true `dataSize`,
+ *        removes DC offset, mutes the 80ms codec turn-on pop, and normalizes speech volume).
+ */
+bool buildFinalWavFromRawTemp(const char* finalWavPath, uint32_t pcmBytes) {
+    if (pcmBytes < AUDIO_DMA_SAMPLES * sizeof(int16_t)) return false;
+
+    File rawIn = SD.open(TEMP_REC_RAW_PATH, FILE_READ);
+    if (!rawIn) return false;
+
+    if (SD.exists(finalWavPath)) {
+        SD.remove(finalWavPath);
+    }
+    File wavOut = SD.open(finalWavPath, FILE_WRITE);
+    if (!wavOut) {
+        rawIn.close();
+        return false;
+    }
+
+    // 1. Write the finalized 44-byte RIFF WAV header sequentially at byte 0
+    WavHeader finalHdr;
+    finalHdr.dataSize    = pcmBytes;
+    finalHdr.overallSize = 36 + pcmBytes;
+    wavOut.write(reinterpret_cast<const uint8_t*>(&finalHdr), sizeof(WavHeader));
+
+    // 2. Compute DC offset and auto-gain factor from stats gathered during recording
+    int32_t dcOffset = (g_recSampleCount > 0)
+                       ? static_cast<int32_t>(g_recSampleSum / static_cast<int64_t>(g_recSampleCount))
+                       : 0;
+    int32_t peakPos  = g_recMaxSample - dcOffset;
+    int32_t peakNeg  = dcOffset - g_recMinSample;
+    int32_t maxPeak  = (peakPos > peakNeg) ? peakPos : peakNeg;
+    if (maxPeak < 1) maxPeak = 1;
+
+    int32_t gainQ8 = (26000 * 256) / maxPeak;
+    if (gainQ8 < 256)  gainQ8 = 256;   // Minimum 1.0x
+    if (gainQ8 > 6144) gainQ8 = 6144;  // Maximum 24.0x boost
+
+    const uint32_t skipSamples = (VOICE_SAMPLE_RATE * 80) / 1000;
+    uint32_t sampleIdx = 0;
+    int16_t* chunk = g_audioDmaBuf[0];
+
+    while (rawIn.available()) {
+        size_t nBytes = rawIn.read(reinterpret_cast<uint8_t*>(chunk), AUDIO_DMA_SAMPLES * sizeof(int16_t));
+        size_t nSamps = nBytes / sizeof(int16_t);
+        if (nSamps == 0) break;
+
+        for (size_t i = 0; i < nSamps; ++i) {
+            uint32_t pos = sampleIdx + i;
+            if (pos < skipSamples) {
+                chunk[i] = 0;
+            } else {
+                int32_t ac = ((static_cast<int32_t>(chunk[i]) - dcOffset) * gainQ8) >> 8;
+                if (pos < skipSamples + 320) {
+                    ac = (ac * static_cast<int32_t>(pos - skipSamples)) / 320;
+                }
+                if (ac > 32767)  ac = 32767;
+                if (ac < -32768) ac = -32768;
+                chunk[i] = static_cast<int16_t>(ac);
+            }
+        }
+
+        wavOut.write(reinterpret_cast<const uint8_t*>(chunk), nSamps * sizeof(int16_t));
+        sampleIdx += nSamps;
+    }
+
+    wavOut.close();
+    rawIn.close();
+    SD.remove(TEMP_REC_RAW_PATH);
+    return true;
+}
+
 void stopAndSendVoiceRecording(bool cancelOnly = false) {
     if (!g_isRecordingVoice) return;
 
-    // Wait for remaining queued DMA slots to finish
     while (M5Cardputer.Mic.isRecording()) {
         delay(1);
     }
 
-    uint32_t elapsedSec = (millis() - g_recordStartMs + 500) / 1000;
-    if (elapsedSec < 1) elapsedSec = 1;
+    while (g_recWriteStep < g_recQueueStep) {
+        int slot = static_cast<int>(g_recWriteStep % 3);
+        uint32_t sampleStartIdx = g_recordedDataBytes / sizeof(int16_t);
+        accumulateRecordingStats(g_audioDmaBuf[slot], AUDIO_DMA_SAMPLES, sampleStartIdx);
 
-    // Finalize 44-byte RIFF WAV header
-    WavHeader finalHdr;
-    finalHdr.dataSize    = g_recordedDataBytes;
-    finalHdr.overallSize = 36 + g_recordedDataBytes;
-    g_recordFile.seek(0);
-    g_recordFile.write(reinterpret_cast<const uint8_t*>(&finalHdr), sizeof(WavHeader));
+        size_t bytesToWrite = AUDIO_DMA_SAMPLES * sizeof(int16_t);
+        g_recordFile.write(reinterpret_cast<const uint8_t*>(g_audioDmaBuf[slot]), bytesToWrite);
+        g_recordedDataBytes += bytesToWrite;
+        ++g_recWriteStep;
+    }
+
     g_recordFile.close();
-
     g_isRecordingVoice = false;
     ensureSpeakerActive();
 
-    if (cancelOnly || g_recordedDataBytes < 1024 || g_chats.empty()) {
-        if (!g_activeRecordPath.isEmpty() && SD.exists(g_activeRecordPath.c_str())) {
-            SD.remove(g_activeRecordPath.c_str());
+    uint32_t elapsedSec = (millis() - g_recordStartMs + 500) / 1000;
+    if (elapsedSec < 1) elapsedSec = 1;
+
+    if (cancelOnly || g_recordedDataBytes < 2048 || g_chats.empty()) {
+        if (SD.exists(TEMP_REC_RAW_PATH)) {
+            SD.remove(TEMP_REC_RAW_PATH);
         }
         g_activeRecordPath    = "";
         g_pauseBackgroundPoll = false;
@@ -1322,8 +1479,22 @@ void stopAndSendVoiceRecording(bool cancelOnly = false) {
         return;
     }
 
+    g_isSendingMessage = true;
+    g_netStatusBadge   = "SAVING WAV";
+    g_uiDirty          = true;
+    renderUI();
+
+    if (!buildFinalWavFromRawTemp(g_activeRecordPath.c_str(), g_recordedDataBytes)) {
+        playErrorChime();
+        g_activeRecordPath    = "";
+        g_isSendingMessage    = false;
+        g_pauseBackgroundPoll = false;
+        g_netStatusBadge      = "WAV ERR";
+        g_uiDirty             = true;
+        return;
+    }
+
     int64_t targetChatId = g_chats[g_selectedChatIndex].chatId;
-    g_isSendingMessage   = true;
     g_netStatusBadge     = "UPLOADING";
     g_uiDirty            = true;
     renderUI();
@@ -1332,10 +1503,11 @@ void stopAndSendVoiceRecording(bool cancelOnly = false) {
     bool sentOk = sendTelegramWavAudio(targetChatId, g_activeRecordPath.c_str(), elapsedSec, uploadedFileId);
     if (sentOk) {
         playSendChime();
-        String label = "[Voice Sent " + String(elapsedSec) + "s] (Fn+P Play)";
+        String label = "[Voice Sent " + String(elapsedSec) + "s - Enter]";
         appendMessageToChat(g_selectedChatIndex, true, label, millis() / 1000,
                             MediaType::VOICE, uploadedFileId, elapsedSec, g_activeRecordPath);
         promoteChatToTop(g_selectedChatIndex, true);
+        g_selectedMsgIndex   = static_cast<int>(g_chats[g_selectedChatIndex].messages.size()) - 1;
         g_threadScrollOffset = 0;
         g_netStatusBadge     = "LIVE";
         saveContactsIndexToSD();
@@ -1351,12 +1523,10 @@ void stopAndSendVoiceRecording(bool cancelOnly = false) {
 }
 
 /**
- * @brief Plays a WAV file from MicroSD gaplessly using the 2-slot `g_audioDmaBuf` DMA queue.
+ * @brief Plays ONLY uncompressed RIFF WAVE (.wav) files from MicroSD.
+ *        Blocks any non-WAV (.oga, .mp4, etc.) files cleanly without crashing!
  */
-void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool isVideoMessage) {
-    (void)expectedDurationSec;
-    (void)isVideoMessage;
-
+void playWavFileFromSD(const char* sdPath) {
     File f = SD.open(sdPath, FILE_READ);
     if (!f || f.size() < 44) {
         if (f) f.close();
@@ -1364,18 +1534,17 @@ void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool 
         return;
     }
 
-    char riffMagic[12] = {0};
-    f.readBytes(riffMagic, 12);
-    bool isRiffWave = (memcmp(riffMagic, "RIFF", 4) == 0 && memcmp(riffMagic + 8, "WAVE", 4) == 0);
-
+    uint8_t magic[12] = {0};
+    f.read(magic, 12);
+    bool isRiffWave = (memcmp(magic, "RIFF", 4) == 0 && memcmp(magic + 8, "WAVE", 4) == 0);
     if (!isRiffWave) {
         f.close();
-        g_netStatusBadge  = "NEED WAV";
-        g_audioPlayBanner = "Format is .oga/.mp4 (Need WAV)";
+        g_netStatusBadge  = "WAV ONLY";
+        g_audioPlayBanner = "Blocked: Only .wav playable";
         g_uiDirty         = true;
         renderUI();
         playErrorChime();
-        delay(1200);
+        delay(1100);
         return;
     }
 
@@ -1413,6 +1582,10 @@ void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool 
         }
     }
 
+    if (dataSize == 0 && f.size() > dataOffset) {
+        dataSize = f.size() - dataOffset;
+    }
+
     f.seek(dataOffset);
     if (sampleRate < 4000 || sampleRate > 48000) {
         sampleRate = VOICE_SAMPLE_RATE;
@@ -1436,7 +1609,6 @@ void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool 
         if (numChannels == 2) samplesRead /= 2;
         if (samplesRead == 0) break;
 
-        // Wait only while BOTH DMA slots are occupied (isPlaying(0) == 2)
         while (M5Cardputer.Speaker.isPlaying(0) > 1) {
             delay(1);
         }
@@ -1449,7 +1621,7 @@ void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool 
             1,
             0
         );
-        bufIdx ^= 1;
+        bufIdx = (bufIdx + 1) % 3;
     }
 
     while (M5Cardputer.Speaker.isPlaying(0)) {
@@ -1458,52 +1630,207 @@ void playAudioFileFromSD(const char* sdPath, uint16_t expectedDurationSec, bool 
 
     f.close();
     g_pauseBackgroundPoll = false;
+    g_netStatusBadge = "LIVE";
 }
 
-void playLatestChatMedia() {
-    if (g_chats.empty() || g_isPlayingAudio || g_isRecordingVoice || g_isSendingMessage) return;
-
-    ContactChat& chat = g_chats[g_selectedChatIndex];
-    ChatMessage* targetMsg = nullptr;
-
-    for (auto it = chat.messages.rbegin(); it != chat.messages.rend(); ++it) {
-        if (it->mediaType != MediaType::NONE) {
-            targetMsg = &(*it);
+// ============================================================================
+// FULLSCREEN JPEG PHOTO VIEWER (USES BUILT-IN ROM TJPGD IN M5GFX)
+// ============================================================================
+static bool parseJpegDimensions(const uint8_t* jpgBuf, size_t len, uint16_t& outW, uint16_t& outH) {
+    if (len < 12 || jpgBuf[0] != 0xFF || jpgBuf[1] != 0xD8) return false;
+    size_t i = 2;
+    while (i + 9 < len) {
+        if (jpgBuf[i] != 0xFF) {
+            ++i;
+            continue;
+        }
+        while (i < len && jpgBuf[i] == 0xFF) ++i;
+        if (i >= len) break;
+        uint8_t marker = jpgBuf[i++];
+        if (marker == 0xD8 || marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7)) {
+            continue;
+        }
+        if (marker == 0xD9 || marker == 0xDA) {
             break;
         }
-    }
+        if (i + 2 > len) break;
+        uint16_t segLen = static_cast<uint16_t>((jpgBuf[i] << 8) | jpgBuf[i + 1]);
+        if (segLen < 2 || i + segLen > len) break;
 
-    if (!targetMsg) {
-        playErrorChime();
-        g_netStatusBadge = "NO AUDIO";
-        g_uiDirty = true;
+        if (marker == 0xC0 || marker == 0xC1 || marker == 0xC2) {
+            if (i + 7 <= len) {
+                outH = static_cast<uint16_t>((jpgBuf[i + 3] << 8) | jpgBuf[i + 4]);
+                outW = static_cast<uint16_t>((jpgBuf[i + 5] << 8) | jpgBuf[i + 6]);
+                return (outW > 0 && outH > 0);
+            }
+            break;
+        }
+        i += segLen;
+    }
+    return false;
+}
+
+void renderFullscreenPhotoViewer() {
+    canvas.fillSprite(0x0000); // Pure black backdrop for photos
+
+    File f = SD.open(g_activePhotoPath.c_str(), FILE_READ);
+    if (!f || f.size() == 0 || f.size() > 65536) {
+        if (f) f.close();
+        canvas.setFont(&fonts::Font0);
+        canvas.setTextColor(COL_STATUS_ERR);
+        canvas.drawString("Photo unavailable or too large", 24, 60);
+        canvas.pushSprite(0, 0);
         return;
     }
 
-    bool isVideo = (targetMsg->mediaType == MediaType::VIDEO_AUDIO_ONLY);
+    size_t fileSize = f.size();
+    uint8_t* jpgBuf = static_cast<uint8_t*>(malloc(fileSize));
+    if (!jpgBuf) {
+        f.close();
+        canvas.setFont(&fonts::Font0);
+        canvas.setTextColor(COL_STATUS_ERR);
+        canvas.drawString("Not enough RAM for photo", 40, 60);
+        canvas.pushSprite(0, 0);
+        return;
+    }
+
+    f.read(jpgBuf, fileSize);
+    f.close();
+
+    uint16_t imgW = 0, imgH = 0;
+    jpeg_div_t div = JPEG_DIV_NONE;
+    int scale = 1;
+
+    if (parseJpegDimensions(jpgBuf, fileSize, imgW, imgH)) {
+        if (imgW > SCREEN_WIDTH * 4 || imgH > SCREEN_HEIGHT * 4) {
+            div   = JPEG_DIV_8;
+            scale = 8;
+        } else if (imgW > SCREEN_WIDTH * 2 || imgH > SCREEN_HEIGHT * 2) {
+            div   = JPEG_DIV_4;
+            scale = 4;
+        } else if (imgW > SCREEN_WIDTH || imgH > SCREEN_HEIGHT) {
+            div   = JPEG_DIV_2;
+            scale = 2;
+        }
+    }
+
+    int drawX = 0;
+    int drawY = 0;
+    if (imgW > 0 && imgH > 0) {
+        int scaledW = imgW / scale;
+        int scaledH = imgH / scale;
+        if (scaledW < SCREEN_WIDTH)  drawX = (SCREEN_WIDTH  - scaledW) / 2;
+        if (scaledH < SCREEN_HEIGHT) drawY = (SCREEN_HEIGHT - scaledH) / 2;
+    }
+
+    canvas.drawJpg(jpgBuf, fileSize, drawX, drawY, SCREEN_WIDTH, SCREEN_HEIGHT, 0, 0, div);
+    free(jpgBuf);
+
+    // Subtle bottom hint bar
+    canvas.fillRect(0, SCREEN_HEIGHT - 13, SCREEN_WIDTH, 13, COL_BG_HEADER);
+    canvas.drawFastHLine(0, SCREEN_HEIGHT - 13, SCREEN_WIDTH, COL_BORDER);
+    canvas.setFont(&fonts::Font0);
+    canvas.setTextSize(1);
+    canvas.setTextDatum(top_left);
+    canvas.setTextColor(COL_ACCENT_CYAN);
+    canvas.drawString(ellipsizeText(canvas, g_activePhotoTitle, 145), 4, SCREEN_HEIGHT - 10);
+    canvas.setTextColor(COL_TEXT_SECONDARY);
+    canvas.drawString("[Any Key: Close]", SCREEN_WIDTH - 96, SCREEN_HEIGHT - 10);
+
+    canvas.pushSprite(0, 0);
+}
+
+/**
+ * @brief Triggered when pressing ENTER in View B with an empty input bar:
+ *        - Plays `.wav` audio messages (and blocks non-.wav received audio).
+ *        - Downloads and opens `MediaType::PHOTO` messages fullscreen!
+ */
+void activateSelectedMessage() {
+    if (g_chats.empty() || g_isPlayingAudio || g_isRecordingVoice || g_isSendingMessage) return;
+
+    ContactChat& chat = g_chats[g_selectedChatIndex];
+    if (chat.messages.empty()) return;
+
+    if (g_selectedMsgIndex < 0 || g_selectedMsgIndex >= static_cast<int>(chat.messages.size())) {
+        g_selectedMsgIndex = static_cast<int>(chat.messages.size()) - 1;
+    }
+
+    ChatMessage& targetMsg = chat.messages[g_selectedMsgIndex];
+    if (targetMsg.mediaType == MediaType::NONE) {
+        return;
+    }
+
+    // Case 1: Photo Message -> Download JPEG thumbnail (if not cached on SD) and open Fullscreen Viewer
+    if (targetMsg.mediaType == MediaType::PHOTO) {
+        if (targetMsg.localAudioPath.isEmpty() || !SD.exists(targetMsg.localAudioPath.c_str())) {
+            if (targetMsg.mediaFileId.isEmpty()) {
+                playErrorChime();
+                return;
+            }
+            targetMsg.localAudioPath = generateUniquePhotoFilePath(chat.chatId);
+            g_isPlayingAudio  = true;
+            g_audioPlayBanner = "Downloading Photo...";
+            g_uiDirty         = true;
+            renderUI();
+
+            bool dlOk = downloadTelegramMediaFile(targetMsg.mediaFileId, targetMsg.localAudioPath.c_str());
+            g_isPlayingAudio  = false;
+            g_audioPlayBanner = "";
+
+            if (!dlOk) {
+                playErrorChime();
+                g_netStatusBadge = "DL FAIL";
+                g_uiDirty = true;
+                return;
+            }
+            rewriteFullChatHistoryToSD(chat);
+        }
+
+        g_activePhotoPath  = targetMsg.localAudioPath;
+        g_activePhotoTitle = chat.name + ": Photo";
+        g_isViewingPhoto   = true;
+        g_uiDirty          = true;
+        renderUI();
+        return;
+    }
+
+    // Case 2: Voice / Audio / Video Message -> Block anything received other than .wav!
+    if (!targetMsg.isOutgoing && targetMsg.mediaType != MediaType::AUDIO) {
+        // Incoming Telegram voice (.oga) and video notes (.mp4) are blocked on Cardputer
+        g_isPlayingAudio  = true;
+        g_netStatusBadge  = "WAV ONLY";
+        g_audioPlayBanner = "Blocked: Only .wav playable";
+        g_uiDirty         = true;
+        renderUI();
+        playErrorChime();
+        delay(1100);
+        g_isPlayingAudio  = false;
+        g_audioPlayBanner = "";
+        g_uiDirty         = true;
+        return;
+    }
+
     g_isPlayingAudio  = true;
-    g_audioPlayBanner = isVideo ? "Video Msg: Audio Only..." : "Playing Voice Msg...";
+    g_audioPlayBanner = "Playing .wav Audio...";
     g_uiDirty         = true;
     renderUI();
 
-    if (!targetMsg->localAudioPath.isEmpty() && SD.exists(targetMsg->localAudioPath.c_str())) {
-        playAudioFileFromSD(targetMsg->localAudioPath.c_str(), targetMsg->mediaDurationSec, isVideo);
-    } else if (!targetMsg->mediaFileId.isEmpty()) {
-        if (targetMsg->localAudioPath.isEmpty()) {
-            const char* ext = isVideo ? ".mp4" : ".wav";
-            targetMsg->localAudioPath = generateUniqueAudioFilePath(chat.chatId, targetMsg->isOutgoing, ext);
+    if (!targetMsg.localAudioPath.isEmpty() && SD.exists(targetMsg.localAudioPath.c_str())) {
+        playWavFileFromSD(targetMsg.localAudioPath.c_str());
+    } else if (!targetMsg.mediaFileId.isEmpty()) {
+        if (targetMsg.localAudioPath.isEmpty()) {
+            targetMsg.localAudioPath = generateUniqueAudioFilePath(chat.chatId, targetMsg.isOutgoing, ".wav");
         }
-
-        g_audioPlayBanner = isVideo ? "DL Video Audio..." : "DL Voice Msg...";
+        g_audioPlayBanner = "Downloading Audio...";
         g_uiDirty         = true;
         renderUI();
 
-        if (downloadTelegramMediaFile(targetMsg->mediaFileId, targetMsg->localAudioPath.c_str())) {
+        if (downloadTelegramMediaFile(targetMsg.mediaFileId, targetMsg.localAudioPath.c_str())) {
             rewriteFullChatHistoryToSD(chat);
-            g_audioPlayBanner = isVideo ? "Video Note (Audio Only)" : "Playing Voice Note...";
+            g_audioPlayBanner = "Playing .wav Audio...";
             g_uiDirty         = true;
             renderUI();
-            playAudioFileFromSD(targetMsg->localAudioPath.c_str(), targetMsg->mediaDurationSec, isVideo);
+            playWavFileFromSD(targetMsg.localAudioPath.c_str());
         } else {
             playErrorChime();
             g_netStatusBadge = "DL FAIL";
@@ -1521,6 +1848,76 @@ void playLatestChatMedia() {
 // ============================================================================
 // UI RENDERING ENGINE (240x135 DARK THEME)
 // ============================================================================
+static void buildWrappedChatLines(const ContactChat& chat, std::vector<WrappedMessageLine>& outLines) {
+    outLines.clear();
+    const int maxBubbleTextWidth = SCREEN_WIDTH - 16;
+
+    for (size_t mIdx = 0; mIdx < chat.messages.size(); ++mIdx) {
+        const ChatMessage& msg = chat.messages[mIdx];
+        std::vector<String> msgLines;
+        wrapTextToLines(canvas, msg.text, maxBubbleTextWidth, msgLines);
+        for (size_t i = 0; i < msgLines.size(); ++i) {
+            WrappedMessageLine wl;
+            wl.msgIndex         = static_cast<int>(mIdx);
+            wl.isOutgoing       = msg.isOutgoing;
+            wl.isFirstLineOfMsg = (i == 0);
+            wl.isLastLineOfMsg  = (i + 1 == msgLines.size());
+            wl.lineText         = msgLines[i];
+            outLines.push_back(wl);
+        }
+    }
+}
+
+static void scrollViewportToSelectedMessage(const ContactChat& chat) {
+    if (chat.messages.empty()) {
+        g_selectedMsgIndex   = -1;
+        g_threadScrollOffset = 0;
+        return;
+    }
+
+    if (g_selectedMsgIndex < 0) {
+        g_selectedMsgIndex = 0;
+    }
+    if (g_selectedMsgIndex >= static_cast<int>(chat.messages.size())) {
+        g_selectedMsgIndex = static_cast<int>(chat.messages.size()) - 1;
+    }
+
+    std::vector<WrappedMessageLine> allLines;
+    buildWrappedChatLines(chat, allLines);
+
+    const int lineHeight       = 12;
+    const int visibleLineCount = VIEW_B_BODY_H / lineHeight; // 8 lines visible
+    const int totalLines       = static_cast<int>(allLines.size());
+    const int maxScroll        = (totalLines > visibleLineCount) ? (totalLines - visibleLineCount) : 0;
+
+    int msgFirstLine = -1;
+    int msgLastLine  = -1;
+    for (int i = 0; i < totalLines; ++i) {
+        if (allLines[i].msgIndex == g_selectedMsgIndex) {
+            if (msgFirstLine == -1) msgFirstLine = i;
+            msgLastLine = i;
+        }
+    }
+
+    if (msgFirstLine == -1) return;
+
+    int startLine = totalLines - visibleLineCount - g_threadScrollOffset;
+    if (startLine < 0) startLine = 0;
+    int endLine = startLine + visibleLineCount - 1;
+
+    if (msgFirstLine < startLine) {
+        startLine = msgFirstLine;
+        g_threadScrollOffset = totalLines - visibleLineCount - startLine;
+    } else if (msgLastLine > endLine) {
+        startLine = msgLastLine - visibleLineCount + 1;
+        if (startLine < 0) startLine = 0;
+        g_threadScrollOffset = totalLines - visibleLineCount - startLine;
+    }
+
+    if (g_threadScrollOffset > maxScroll) g_threadScrollOffset = maxScroll;
+    if (g_threadScrollOffset < 0)         g_threadScrollOffset = 0;
+}
+
 void renderViewAChatList() {
     canvas.fillSprite(COL_BG_DARK);
     canvas.setFont(&fonts::Font0);
@@ -1609,9 +2006,9 @@ void renderViewAChatList() {
 
         canvas.setTextColor(COL_TEXT_SECONDARY);
         canvas.drawString("1. Open Telegram", rightX + 8, VIEW_A_BODY_Y + 34);
-        canvas.drawString("2. Send text/voice", rightX + 8, VIEW_A_BODY_Y + 46);
+        canvas.drawString("2. Send text/photo", rightX + 8, VIEW_A_BODY_Y + 46);
         canvas.drawString("   to your Bot", rightX + 8, VIEW_A_BODY_Y + 58);
-        canvas.drawString("3. All chats & audio", rightX + 8, VIEW_A_BODY_Y + 70);
+        canvas.drawString("3. All chats & media", rightX + 8, VIEW_A_BODY_Y + 70);
         canvas.drawString("   saved on SD!", rightX + 8, VIEW_A_BODY_Y + 82);
     } else {
         const ContactChat& sel = g_chats[g_selectedChatIndex];
@@ -1666,6 +2063,7 @@ void renderViewAChatList() {
 /**
  * @brief Renders View B: Conversation Chat Thread
  *        - Uniform dark background (no zebra/alternating backgrounds).
+ *        - Highlighted message selection (`g_selectedMsgIndex`) moved via Up/Down arrows (`Fn+;` / `Fn+.`).
  *        - Messages separated cleanly by a thin dark horizontal line (`COL_MSG_SEPARATOR`).
  *        - Received messages are grey (left-aligned); sent messages are blue (right-aligned).
  */
@@ -1687,31 +2085,26 @@ void renderViewBConversation() {
         canvas.setTextColor(COL_ACCENT_CYAN);
         canvas.drawString("<", 5, 5);
         canvas.setTextColor(COL_TEXT_PRIMARY);
-        String title = ellipsizeText(canvas, chat.name, 120);
+        String title = ellipsizeText(canvas, chat.name, 118);
         canvas.drawString(title, 15, 5);
 
         canvas.setTextColor(COL_TEXT_SECONDARY);
-        canvas.drawString("Fn+R:Rec Fn+P:Play", SCREEN_WIDTH - 110, 5);
+        canvas.drawString("Fn+R:Mic Ent:Open", SCREEN_WIDTH - 105, 5);
     }
 
     // 2. Message History Body (Y = 18 to 119, Height = 102px)
     if (!g_chats.empty() && g_selectedChatIndex >= 0 && g_selectedChatIndex < static_cast<int>(g_chats.size())) {
         const ContactChat& chat = g_chats[g_selectedChatIndex];
+        if (!chat.messages.empty()) {
+            if (g_selectedMsgIndex < 0 || g_selectedMsgIndex >= static_cast<int>(chat.messages.size())) {
+                g_selectedMsgIndex = static_cast<int>(chat.messages.size()) - 1;
+            }
+        } else {
+            g_selectedMsgIndex = -1;
+        }
 
         std::vector<WrappedMessageLine> allLines;
-        const int maxBubbleTextWidth = SCREEN_WIDTH - 16;
-
-        for (const auto& msg : chat.messages) {
-            std::vector<String> msgLines;
-            wrapTextToLines(canvas, msg.text, maxBubbleTextWidth, msgLines);
-            for (size_t i = 0; i < msgLines.size(); ++i) {
-                WrappedMessageLine wl;
-                wl.isOutgoing      = msg.isOutgoing;
-                wl.isLastLineOfMsg = (i + 1 == msgLines.size());
-                wl.lineText        = msgLines[i];
-                allLines.push_back(wl);
-            }
-        }
+        buildWrappedChatLines(chat, allLines);
 
         const int lineHeight = 12;
         const int visibleLineCount = VIEW_B_BODY_H / lineHeight; // 8 lines visible at once
@@ -1734,18 +2127,28 @@ void renderViewBConversation() {
 
                 const WrappedMessageLine& item = allLines[lineIdx];
                 int rowY = VIEW_B_BODY_Y + 2 + (row * lineHeight);
+                bool isMsgSelected = (item.msgIndex == g_selectedMsgIndex);
+
+                if (isMsgSelected) {
+                    canvas.fillRect(2, rowY, SCREEN_WIDTH - 4, lineHeight - 1, COL_BG_ROW_SEL);
+                    if (item.isOutgoing) {
+                        canvas.fillRect(SCREEN_WIDTH - 4, rowY, 2, lineHeight - 1, COL_ACCENT_CYAN);
+                    } else {
+                        canvas.fillRect(2, rowY, 2, lineHeight - 1, COL_ACCENT_CYAN);
+                    }
+                }
 
                 if (item.isOutgoing) {
                     // Sent messages: right-aligned, blue text
                     canvas.setTextColor(COL_TEXT_OUTGOING);
                     int textW = canvas.textWidth(item.lineText);
-                    int drawX = SCREEN_WIDTH - 6 - textW;
+                    int drawX = SCREEN_WIDTH - 7 - textW;
                     if (drawX < 6) drawX = 6;
                     canvas.drawString(item.lineText, drawX, rowY + 1);
                 } else {
                     // Received messages: left-aligned, grey text
                     canvas.setTextColor(COL_TEXT_INCOMING);
-                    canvas.drawString(item.lineText, 6, rowY + 1);
+                    canvas.drawString(item.lineText, 7, rowY + 1);
                 }
 
                 // Thin dark separator line at the bottom of each message
@@ -1797,6 +2200,10 @@ void renderViewBConversation() {
 void renderUI() {
     if (!g_uiDirty || g_screenState == ScreenPowerState::OFF) return;
     g_uiDirty = false;
+    if (g_isViewingPhoto) {
+        renderFullscreenPhotoViewer();
+        return;
+    }
     if (g_currentView == AppView::CHAT_LIST_HUB) {
         renderViewAChatList();
     } else {
@@ -1824,10 +2231,21 @@ void handlePhysicalKeyboard() {
 
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
 
-    // If currently recording a voice message, handle Enter (send), Fn+R (send), or Del (cancel)
+    // If viewing a fullscreen photo, pressing any key closes the photo viewer
+    if (g_isViewingPhoto) {
+        g_isViewingPhoto = false;
+        g_uiDirty        = true;
+        return;
+    }
+
+    // If currently recording a voice message, handle Del (cancel), Enter (send), or Fn+R (send)
+    // with a 600ms guard so releasing Fn+R after starting recording never stops it early!
     if (g_isRecordingVoice) {
         if (status.del) {
             stopAndSendVoiceRecording(true);
+            return;
+        }
+        if (now - g_recordStartMs < 600UL) {
             return;
         }
         if (status.enter) {
@@ -1850,10 +2268,12 @@ void handlePhysicalKeyboard() {
         if (g_currentView == AppView::CHAT_LIST_HUB) {
             if (!g_chats.empty()) {
                 g_currentView = AppView::CONVERSATION_THREAD;
-                if (g_chats[g_selectedChatIndex].hasUnread) {
-                    g_chats[g_selectedChatIndex].hasUnread = false;
+                ContactChat& activeChat = g_chats[g_selectedChatIndex];
+                if (activeChat.hasUnread) {
+                    activeChat.hasUnread = false;
                     saveContactsIndexToSD();
                 }
+                g_selectedMsgIndex   = static_cast<int>(activeChat.messages.size()) - 1;
                 g_threadScrollOffset = 0;
             }
         } else {
@@ -1881,33 +2301,54 @@ void handlePhysicalKeyboard() {
 
         if (status.enter && !g_chats.empty()) {
             g_currentView = AppView::CONVERSATION_THREAD;
-            if (g_chats[g_selectedChatIndex].hasUnread) {
-                g_chats[g_selectedChatIndex].hasUnread = false;
+            ContactChat& activeChat = g_chats[g_selectedChatIndex];
+            if (activeChat.hasUnread) {
+                activeChat.hasUnread = false;
                 saveContactsIndexToSD();
             }
+            g_selectedMsgIndex   = static_cast<int>(activeChat.messages.size()) - 1;
             g_threadScrollOffset = 0;
             g_uiDirty = true;
         }
         return;
     }
 
-    // 3. View B: Conversation Thread Input, Voice Controls & Scrolling
+    // 3. View B: Conversation Thread Input, Arrow Message Selection & Voice Recording
     if (g_currentView == AppView::CONVERSATION_THREAD) {
         if (g_isSendingMessage || g_isPlayingAudio) return;
 
         if (status.fn) {
             for (char c : status.word) {
                 if (c == ';') {
-                    g_threadScrollOffset += 1;
-                    g_uiDirty = true;
+                    // Up Arrow (Fn + ;): Select previous message and auto-scroll viewport
+                    if (!g_chats.empty()) {
+                        ContactChat& chat = g_chats[g_selectedChatIndex];
+                        if (!chat.messages.empty()) {
+                            if (g_selectedMsgIndex < 0) {
+                                g_selectedMsgIndex = static_cast<int>(chat.messages.size()) - 1;
+                            } else if (g_selectedMsgIndex > 0) {
+                                --g_selectedMsgIndex;
+                            }
+                            scrollViewportToSelectedMessage(chat);
+                            g_uiDirty = true;
+                        }
+                    }
                 } else if (c == '.') {
-                    g_threadScrollOffset -= 1;
-                    if (g_threadScrollOffset < 0) g_threadScrollOffset = 0;
-                    g_uiDirty = true;
+                    // Down Arrow (Fn + .): Select next message and auto-scroll viewport
+                    if (!g_chats.empty()) {
+                        ContactChat& chat = g_chats[g_selectedChatIndex];
+                        if (!chat.messages.empty()) {
+                            if (g_selectedMsgIndex + 1 < static_cast<int>(chat.messages.size())) {
+                                ++g_selectedMsgIndex;
+                            } else {
+                                g_selectedMsgIndex = static_cast<int>(chat.messages.size()) - 1;
+                            }
+                            scrollViewportToSelectedMessage(chat);
+                            g_uiDirty = true;
+                        }
+                    }
                 } else if (c == 'r' || c == 'R') {
                     startVoiceRecording();
-                } else if (c == 'p' || c == 'P') {
-                    playLatestChatMedia();
                 }
             }
             return;
@@ -1931,31 +2372,38 @@ void handlePhysicalKeyboard() {
             }
         }
 
-        // Pressing 'Enter' freezes input, sends payload, and clears input buffer
-        if (status.enter && !g_inputBuffer.isEmpty() && !g_chats.empty()) {
-            String payload = g_inputBuffer;
-            int64_t targetChatId = g_chats[g_selectedChatIndex].chatId;
-
-            g_isSendingMessage = true;
-            g_uiDirty = true;
-            renderUI();
-
-            bool sentOk = sendTelegramMessage(targetChatId, payload);
-            if (sentOk) {
-                playSendChime();
-                appendMessageToChat(g_selectedChatIndex, true, payload, millis() / 1000);
-                promoteChatToTop(g_selectedChatIndex, true);
-                g_threadScrollOffset = 0;
-                g_inputBuffer        = "";
-                saveContactsIndexToSD();
+        // Pressing 'Enter':
+        // - If input buffer has text: freeze input, send text message, clear input buffer.
+        // - If input buffer is EMPTY: play selected .wav audio or view selected Photo!
+        if (status.enter && !g_chats.empty()) {
+            if (g_inputBuffer.isEmpty()) {
+                activateSelectedMessage();
             } else {
-                playErrorChime();
-                g_netStatusBadge = "SEND FAIL";
-                g_inputBuffer    = "";
-            }
+                String payload = g_inputBuffer;
+                int64_t targetChatId = g_chats[g_selectedChatIndex].chatId;
 
-            g_isSendingMessage = false;
-            g_uiDirty = true;
+                g_isSendingMessage = true;
+                g_uiDirty = true;
+                renderUI();
+
+                bool sentOk = sendTelegramMessage(targetChatId, payload);
+                if (sentOk) {
+                    playSendChime();
+                    appendMessageToChat(g_selectedChatIndex, true, payload, millis() / 1000);
+                    promoteChatToTop(g_selectedChatIndex, true);
+                    g_selectedMsgIndex   = static_cast<int>(g_chats[g_selectedChatIndex].messages.size()) - 1;
+                    g_threadScrollOffset = 0;
+                    g_inputBuffer        = "";
+                    saveContactsIndexToSD();
+                } else {
+                    playErrorChime();
+                    g_netStatusBadge = "SEND FAIL";
+                    g_inputBuffer    = "";
+                }
+
+                g_isSendingMessage = false;
+                g_uiDirty = true;
+            }
         }
     }
 }
@@ -2021,6 +2469,8 @@ void connectToWiFi() {
 void setup() {
     auto cfg = M5.config();
     M5Cardputer.begin(cfg, true);
+
+    configureCardputerMicrophone();
 
     M5Cardputer.Display.setRotation(1);
     M5Cardputer.Display.setBrightness(BRIGHTNESS_AWAKE);
