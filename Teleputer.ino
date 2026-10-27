@@ -213,6 +213,7 @@ static SemaphoreHandle_t g_queueMutex = nullptr;
 static TaskHandle_t g_pollTaskHandle  = nullptr;
 static std::vector<IncomingUpdateEvent> g_incomingQueue;
 static volatile bool g_pauseBackgroundPoll = false;
+static volatile bool g_pollTaskBusy        = false;
 static volatile int64_t g_lastUpdateId     = 0;
 static String g_netStatusBadge             = "LIVE";
 
@@ -227,6 +228,7 @@ static String g_inputBuffer      = "";
 static bool g_isSendingMessage   = false;
 static bool g_isPlayingAudio     = false;
 static bool g_isViewingPhoto     = false;
+static unsigned long g_photoOpenMs   = 0;
 static String g_activePhotoPath  = "";
 static String g_activePhotoTitle = "";
 static String g_audioPlayBanner  = "";
@@ -336,8 +338,8 @@ void registerUserActivity() {
     if (g_screenState != ScreenPowerState::AWAKE) {
         if (g_screenState == ScreenPowerState::OFF) {
             M5Cardputer.Display.wakeup();
-            esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         }
+        esp_wifi_set_ps(WIFI_PS_NONE);
         M5Cardputer.Display.setBrightness(BRIGHTNESS_AWAKE);
         g_screenState = ScreenPowerState::AWAKE;
         g_uiDirty = true;
@@ -867,7 +869,7 @@ void backgroundPollTaskCore0(void* param) {
     (void)param;
     WiFiClientSecure pollClient;
     pollClient.setInsecure();
-    pollClient.setTimeout(3);
+    pollClient.setTimeout(5000);
 
     unsigned long lastPollMs = 0;
 
@@ -882,9 +884,10 @@ void backgroundPollTaskCore0(void* param) {
                 WiFi.reconnect();
                 g_netStatusBadge = "RECONN";
             } else {
+                g_pollTaskBusy = true;
                 HTTPClient https;
                 https.setReuse(true);
-                https.setTimeout(2200);
+                https.setTimeout(4000);
 
                 String url = buildBotApiUrl("getUpdates");
                 url += "?timeout=0&limit=5&allowed_updates=%5B%22message%22%5D";
@@ -1030,6 +1033,7 @@ void backgroundPollTaskCore0(void* param) {
                     }
                     https.end();
                 }
+                g_pollTaskBusy = false;
             }
         }
 
@@ -1088,12 +1092,17 @@ bool sendTelegramMessage(int64_t chatId, const String& text) {
     if (WiFi.status() != WL_CONNECTED || text.isEmpty()) return false;
 
     g_pauseBackgroundPoll = true;
+    unsigned long waitPoll = millis();
+    while (g_pollTaskBusy && (millis() - waitPoll < 1500UL)) {
+        delay(10);
+    }
+
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(5);
+    client.setTimeout(6000);
 
     HTTPClient https;
-    https.setTimeout(5000);
+    https.setTimeout(6000);
 
     bool success = false;
     String url = buildBotApiUrl("sendMessage");
@@ -1111,8 +1120,9 @@ bool sendTelegramMessage(int64_t chatId, const String& text) {
 
         int httpCode = https.POST(requestBody);
         if (httpCode == HTTP_CODE_OK) {
+            String respStr = https.getString();
             DynamicJsonDocument respDoc(JSON_SEND_DOC_SIZE);
-            if (deserializeJson(respDoc, https.getStream()) == DeserializationError::Ok &&
+            if (deserializeJson(respDoc, respStr) == DeserializationError::Ok &&
                 (respDoc["ok"] | false)) {
                 success = true;
             }
@@ -1140,9 +1150,14 @@ bool sendTelegramWavAudio(int64_t chatId, const char* sdFilePath, uint16_t durat
     }
 
     g_pauseBackgroundPoll = true;
+    unsigned long waitPoll = millis();
+    while (g_pollTaskBusy && (millis() - waitPoll < 1500UL)) {
+        delay(10);
+    }
+
     WiFiClientSecure uploadClient;
     uploadClient.setInsecure();
-    uploadClient.setTimeout(10);
+    uploadClient.setTimeout(15000);
 
     if (!uploadClient.connect("api.telegram.org", 443)) {
         audioFile.close();
@@ -1230,14 +1245,18 @@ bool downloadTelegramMediaFile(const String& fileId, const char* destPath) {
 
     ensureStorageDirectories();
     g_pauseBackgroundPoll = true;
+    unsigned long waitPoll = millis();
+    while (g_pollTaskBusy && (millis() - waitPoll < 1500UL)) {
+        delay(10);
+    }
 
     WiFiClientSecure dlClient;
     dlClient.setInsecure();
-    dlClient.setTimeout(6);
+    dlClient.setTimeout(10000);
 
     HTTPClient https;
     https.setReuse(true);
-    https.setTimeout(6000);
+    https.setTimeout(10000);
 
     String getFileUrl = buildBotApiUrl("getFile") + "?file_id=" + fileId;
     if (!https.begin(dlClient, getFileUrl)) {
@@ -1248,8 +1267,9 @@ bool downloadTelegramMediaFile(const String& fileId, const char* destPath) {
     int code = https.GET();
     String remoteFilePath = "";
     if (code == HTTP_CODE_OK) {
+        String respStr = https.getString();
         DynamicJsonDocument doc(JSON_SEND_DOC_SIZE);
-        if (deserializeJson(doc, https.getStream()) == DeserializationError::Ok && (doc["ok"] | false)) {
+        if (deserializeJson(doc, respStr) == DeserializationError::Ok && (doc["ok"] | false)) {
             remoteFilePath = String(doc["result"]["file_path"] | "");
         }
         doc.clear();
@@ -1826,6 +1846,7 @@ void activateSelectedMessage() {
         g_activePhotoPath  = targetMsg.localAudioPath;
         g_activePhotoTitle = chat.name + ": Photo";
         g_isViewingPhoto   = true;
+        g_photoOpenMs      = millis();
         g_uiDirty          = true;
         renderUI();
         return;
@@ -1834,26 +1855,26 @@ void activateSelectedMessage() {
     // Case 2: Voice / Audio / Video Message -> Block anything received other than .wav!
     if (!targetMsg.isOutgoing && targetMsg.mediaType != MediaType::AUDIO) {
         // Incoming Telegram voice (.oga) and video notes (.mp4) are blocked on Cardputer
-        g_isPlayingAudio  = true;
         g_netStatusBadge  = "WAV ONLY";
         g_audioPlayBanner = "Blocked: Only .wav playable";
         g_uiDirty         = true;
         renderUI();
         playErrorChime();
         delay(1100);
-        g_isPlayingAudio  = false;
         g_audioPlayBanner = "";
         g_uiDirty         = true;
         return;
     }
 
-    g_isPlayingAudio  = true;
-    g_audioPlayBanner = "Playing .wav Audio...";
-    g_uiDirty         = true;
-    renderUI();
-
     if (!targetMsg.localAudioPath.isEmpty() && SD.exists(targetMsg.localAudioPath.c_str())) {
+        g_isPlayingAudio  = true;
+        g_audioPlayBanner = "Playing .wav Audio...";
+        g_uiDirty         = true;
+        renderUI();
         playWavFileFromSD(targetMsg.localAudioPath.c_str());
+        g_isPlayingAudio  = false;
+        g_audioPlayBanner = "";
+        g_uiDirty         = true;
     } else if (!targetMsg.mediaFileId.isEmpty()) {
         if (targetMsg.localAudioPath.isEmpty()) {
             targetMsg.localAudioPath = generateUniqueAudioFilePath(chat.chatId, targetMsg.isOutgoing, ".wav");
@@ -1864,11 +1885,18 @@ void activateSelectedMessage() {
 
         if (downloadTelegramMediaFile(targetMsg.mediaFileId, targetMsg.localAudioPath.c_str())) {
             rewriteFullChatHistoryToSD(chat);
+            g_isPlayingAudio  = true;
             g_audioPlayBanner = "Playing .wav Audio...";
             g_uiDirty         = true;
             renderUI();
             playWavFileFromSD(targetMsg.localAudioPath.c_str());
+            g_isPlayingAudio  = false;
+            g_audioPlayBanner = "";
+            g_uiDirty         = true;
         } else {
+            g_audioPlayBanner = "";
+            g_uiDirty         = true;
+            renderUI();
             playErrorChime();
             g_netStatusBadge = "DL FAIL";
         }
@@ -2269,9 +2297,12 @@ void handlePhysicalKeyboard() {
     Keyboard_Class::KeysState status = M5Cardputer.Keyboard.keysState();
 
     // If viewing a fullscreen photo, pressing any key closes the photo viewer
+    // (with a 300ms guard so the Enter key press that opened it does not close it instantly)
     if (g_isViewingPhoto) {
-        g_isViewingPhoto = false;
-        g_uiDirty        = true;
+        if (now - g_photoOpenMs >= 300UL) {
+            g_isViewingPhoto = false;
+            g_uiDirty        = true;
+        }
         return;
     }
 
@@ -2435,7 +2466,7 @@ void handlePhysicalKeyboard() {
                 } else {
                     playErrorChime();
                     g_netStatusBadge = "SEND FAIL";
-                    g_inputBuffer    = "";
+                    // Keep g_inputBuffer intact so the drafted message is not lost on network failure
                 }
 
                 g_isSendingMessage = false;
